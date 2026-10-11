@@ -19,11 +19,19 @@
       "dest": "api/index.py"
     },
     {
-      "src": "/swagger/(.*)",
+      "src": "/swagger.json",
       "dest": "api/index.py"
     },
     {
-      "src": "/redoc/(.*)",
+      "src": "/swagger.yaml",
+      "dest": "api/index.py"
+    },
+    {
+      "src": "/swagger(.*)",
+      "dest": "api/index.py"
+    },
+    {
+      "src": "/redoc(.*)",
       "dest": "api/index.py"
     },
     {
@@ -31,4 +39,5 @@
       "dest": "frontend_react/$1"
     }
   ]
+
 }
