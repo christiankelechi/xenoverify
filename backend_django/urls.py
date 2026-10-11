@@ -33,14 +33,21 @@ schema_view = get_schema_view(
     permission_classes=(permissions.AllowAny,),
 )
 
+from django.shortcuts import render
+
+def cdn_swagger_view(request):
+    return render(request, "swagger_cdn.html")
+
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/", include("core_identity.urls")),
 
-    # Swagger & ReDoc Documentation URLs
-    path("swagger/", schema_view.with_ui("swagger", cache_timeout=0), name="schema-swagger-ui"),
+    # Swagger Documentation URLs
+    path("swagger/", cdn_swagger_view, name="swagger-ui-cdn"),
+    path("swagger-drf/", schema_view.with_ui("swagger", cache_timeout=0), name="schema-swagger-ui"),
     path("redoc/", schema_view.with_ui("redoc", cache_timeout=0), name="schema-redoc"),
     re_path(r"^swagger(?P<format>\.json|\.yaml)$", schema_view.without_ui(cache_timeout=0), name="schema-json"),
 ]
+
 
 
