@@ -1,0 +1,6 @@
+Django>=5.0
+djangorestframework>=3.14.0
+django-cors-headers>=4.3.0
+cryptography>=42.0.0
+dilithium-py>=1.4.0
+drf-yasg>=1.21.7

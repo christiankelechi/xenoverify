@@ -1,17 +1,18 @@
 """
-URL configuration for Xenoverify Core Identity API
+Clean URL routing for Core Identity REST API.
+Delegates to modular controllers in core_identity.api.views.
 """
 
 from django.urls import path
-from .views import (
+from core_identity.api.views import (
     SystemInfoView,
     InitializeIssuerView,
     IssueCredentialView,
     ListCredentialsView,
+    RevokeCredentialView,
     GenerateSelectiveDisclosureProofView,
     VerifySelectiveDisclosureProofView,
-    RevokeCredentialView,
-    RunBenchmarkSuiteView
+    RunBenchmarkSuiteView,
 )
 
 urlpatterns = [
