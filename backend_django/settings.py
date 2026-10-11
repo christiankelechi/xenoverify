@@ -10,10 +10,14 @@ For the full list of settings and their values, see
 https://docs.djangoproject.com/en/5.0/ref/settings/
 """
 
+import os
+import sys
+import shutil
 from pathlib import Path
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
+
 
 
 # Quick-start development settings - unsuitable for production
@@ -81,15 +85,24 @@ TEMPLATES = [
 WSGI_APPLICATION = "backend_django.wsgi.application"
 
 
-# Database
-# https://docs.djangoproject.com/en/5.0/ref/settings/#databases
+# Database Configuration
+# Vercel serverless functions have a read-only filesystem except for /tmp
+if "VERCEL" in os.environ:
+    DB_PATH = Path("/tmp") / "db.sqlite3"
+    SOURCE_DB = BASE_DIR / "db.sqlite3"
+    if SOURCE_DB.exists() and not DB_PATH.exists():
+        shutil.copyfile(SOURCE_DB, DB_PATH)
+else:
+    DB_PATH = BASE_DIR / "db.sqlite3"
 
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": DB_PATH,
     }
 }
+
+
 
 
 # Password validation
