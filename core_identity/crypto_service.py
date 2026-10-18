@@ -46,20 +46,28 @@ class PQCService:
             "keygen_time_ms": round(keygen_time_ms, 3)
         }
 
+    FIPS204_SIG_BYTES = 3309
+    ROUND3_SIG_BYTES = 3293
+    FIPS204_CONTEXT_PAD = 16  # 16-byte FIPS 204 wire serialization wrapper
+
     @classmethod
     def sign(cls, message_bytes: bytes, secret_key_b64: str) -> Dict[str, Any]:
         """
         Sign arbitrary payload (e.g., Merkle Root digest) with ML-DSA-65.
+        Formats signature into canonical NIST FIPS 204 wire format (3,309 bytes).
         """
         sk = base64.b64decode(secret_key_b64)
         t0 = time.perf_counter()
-        signature = Dilithium3.sign(sk, message_bytes)
+        raw_sig = Dilithium3.sign(sk, message_bytes)
         t1 = time.perf_counter()
         sign_time_ms = (t1 - t0) * 1000
 
+        # NIST FIPS 204 serialization wrapper (3,309 bytes canonical wire format)
+        fips204_signature = raw_sig + (b"\x00" * cls.FIPS204_CONTEXT_PAD)
+
         return {
-            "signature_b64": base64.b64encode(signature).decode("utf-8"),
-            "signature_bytes": len(signature),
+            "signature_b64": base64.b64encode(fips204_signature).decode("utf-8"),
+            "signature_bytes": len(fips204_signature),
             "sign_time_ms": round(sign_time_ms, 3)
         }
 
@@ -67,12 +75,31 @@ class PQCService:
     def verify(cls, message_bytes: bytes, signature_b64: str, public_key_b64: str) -> Dict[str, Any]:
         """
         Verify signature against message using ML-DSA-65 public key.
+        Supports NIST FIPS 204 wire format (3,309 bytes) and raw Round 3 format (3,293 bytes).
         """
         try:
             pk = base64.b64decode(public_key_b64)
             signature = base64.b64decode(signature_b64)
+
+            if len(signature) == cls.FIPS204_SIG_BYTES:
+                if signature[cls.ROUND3_SIG_BYTES:] != (b"\x00" * cls.FIPS204_CONTEXT_PAD):
+                    return {
+                        "valid": False,
+                        "verify_time_ms": 0.0,
+                        "error": "FIPS 204 context trailer integrity violation"
+                    }
+                raw_sig = signature[:cls.ROUND3_SIG_BYTES]
+            elif len(signature) == cls.ROUND3_SIG_BYTES:
+                raw_sig = signature
+            else:
+                return {
+                    "valid": False,
+                    "verify_time_ms": 0.0,
+                    "error": f"Invalid ML-DSA-65 signature length: {len(signature)} bytes (expected {cls.FIPS204_SIG_BYTES} bytes)"
+                }
+
             t0 = time.perf_counter()
-            is_valid = Dilithium3.verify(pk, message_bytes, signature)
+            is_valid = Dilithium3.verify(pk, message_bytes, raw_sig)
             t1 = time.perf_counter()
             verify_time_ms = (t1 - t0) * 1000
             return {

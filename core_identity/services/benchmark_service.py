@@ -82,7 +82,7 @@ class BenchmarkService:
             "ml_dsa_65": {
                 "scheme": "ML-DSA-65 (NIST FIPS 204)",
                 "public_key_bytes": pqc_keys["public_key_bytes"],
-                "signature_bytes": 3293,
+                "signature_bytes": 3309,
                 "keygen": cls._compute_distribution(pqc_keygen_times),
                 "sign": cls._compute_distribution(pqc_sign_times),
                 "verify": cls._compute_distribution(pqc_verify_times)

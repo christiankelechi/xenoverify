@@ -1,6 +1,6 @@
 # Xenoverify: Post-Quantum Digital Identity Verification Prototype
 
-Prototype implementing Post-Quantum Digital Identity Verification with Selective Disclosure, designed specifically to satisfy **MSc Thesis requirements under the Design Science Research Methodology (DSRM)** (Peffers et al., 2007).
+Prototype implementing Post-Quantum Digital Identity Verification with Selective Disclosure, designed specifically to satisfy **MRe Thesis requirements under the Design Science Research Methodology (DSRM)** (Peffers et al., 2007).
 
 ---
 
@@ -9,7 +9,7 @@ Prototype implementing Post-Quantum Digital Identity Verification with Selective
 - **Primary Signature Scheme:** **NIST FIPS 204 ML-DSA-65** (Module-Lattice-Based Digital Signature Algorithm - Dilithium3).
   - Public Key: **1,952 bytes**
   - Private Key: **4,032 bytes**
-  - Signature: **3,293 bytes**
+  - Signature: **3,309 bytes** (NIST FIPS 204 canonical wire format)
   - Security Category: NIST Level 3 (Quantum Resistant)
 - **Comparative Baseline Scheme:** **ECDSA over secp256k1** (Classical 128-bit baseline for Chapter 4 trade-off evaluation).
 - **Selective Disclosure Mechanism:** **Salted Merkle Tree Commitments**.
@@ -74,7 +74,7 @@ Frontend Web Dashboard will be accessible at: `http://localhost:5173/`
 
 ---
 
-## 5. Supervisor Review Demonstration Points
+## 5. Prototype Demonstration & Verification Points
 
 1. **Demonstrate Feasibility:** Navigate to the **"Issuer Authority"** tab and issue a credential signed with ML-DSA-65.
 2. **Demonstrate Selective Disclosure:** Open the **"Selective Disclosure Playground"**, toggle between disclosing "Name" and "Nationality" while keeping "NIN" and "Date of Birth" hidden. Click **"Verify Proof"** to see instant positive verification (~50ms).

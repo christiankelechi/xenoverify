@@ -37,7 +37,7 @@ class IssuedCredential(models.Model):
     merkle_root = models.CharField(max_length=64, db_index=True)
     signature_scheme = models.CharField(max_length=64, default="ML-DSA-65")
     signature_b64 = models.TextField()
-    signature_bytes = models.IntegerField(default=3293)
+    signature_bytes = models.IntegerField(default=3309)
     attributes_json = models.JSONField(help_text="Stores full attribute mapping")
     leaves_json = models.JSONField(help_text="Stores salted leaf details for wallet simulation")
     attribute_count = models.IntegerField(default=0)

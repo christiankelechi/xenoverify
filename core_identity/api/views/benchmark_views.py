@@ -1,5 +1,5 @@
 """
-Empirical Evaluation & Benchmarking API Views (MSc Chapter 4).
+Empirical Evaluation & Benchmarking API Views (MRe Chapter 4).
 """
 
 from rest_framework import status

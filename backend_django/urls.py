@@ -24,7 +24,7 @@ schema_view = get_schema_view(
     openapi.Info(
         title="Xenoverify Post-Quantum Identity API",
         default_version="v1",
-        description="Comprehensive REST API for NIST FIPS 204 ML-DSA-65 Digital Identity Verification & Merkle-Tree Selective Disclosure Prototype (MSc Dissertation DSRM Implementation).",
+        description="Comprehensive REST API for NIST FIPS 204 ML-DSA-65 Digital Identity Verification & Merkle-Tree Selective Disclosure Prototype (MRe Dissertation DSRM Implementation).",
         terms_of_service="https://www.google.com/policies/terms/",
         contact=openapi.Contact(email="research@xenoverify.ac.ng"),
         license=openapi.License(name="MIT License"),

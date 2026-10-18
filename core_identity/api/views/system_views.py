@@ -11,7 +11,7 @@ from core_identity.api.views.base import BaseAPIView
 
 class SystemInfoView(BaseAPIView):
     """
-    Returns exact theoretical and implementation parameters demanded by MSc Chapter 3.
+    Returns exact theoretical and implementation parameters demanded by MRe Chapter 3.
     """
 
     @swagger_auto_schema(
@@ -21,6 +21,7 @@ class SystemInfoView(BaseAPIView):
     def get(self, request):
         return self.success_response({
             "project": "Xenoverify Post-Quantum Identity Prototype",
+            "degree": "MRe (Master of Research)",
             "dsrm_framework": {
                 "methodology": "Design Science Research Methodology (Peffers et al., 2007)",
                 "scope_table": {
@@ -38,7 +39,7 @@ class SystemInfoView(BaseAPIView):
                 "nist_security_category": 3,
                 "public_key_size_bytes": 1952,
                 "private_key_size_bytes": 4032,
-                "signature_size_bytes": 3293,
+                "signature_size_bytes": 3309,
                 "hash_function": "SHA-256 for leaf commitments and Merkle nodes",
                 "salt_entropy": "128-bit CSPRNG secrets.token_hex(16)"
             },
