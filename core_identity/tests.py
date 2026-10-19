@@ -1,24 +1,34 @@
 """
 Automated Cryptographic & Negative Security Test Suite for Xenoverify.
 Comprehensive Test Battery Addressing Empirical Security & Academic Verification Requirements:
-1. Nominal Post-Quantum Workflow (ML-DSA-65 & Salted Merkle Tree)
-2. Classical Baseline Verification (ECDSA secp256k1)
-3. Negative Test 1: Tampered Disclosed Attribute Value
-4. Negative Test 2: Malformed / Injected Sibling Authentication Path
-5. Negative Test 3: Corrupted / Invalid Post-Quantum Signature
-6. Negative Test 4: Substituted Merkle Root Attack
-7. Negative Test 5: Cross-Credential Attribute Splicing (Mix-and-Match Attack)
-8. Negative Test 6: Revoked Credential Presentation Circumvention
-9. Negative Test 7: Presentation Unlinkability & Replay Defense Audit
+1. Nominal Post-Quantum Workflow (NIST FIPS 204 ML-DSA-65 & Salted Merkle Tree)
+2. Negative Test 1: Tampered Disclosed Attribute Value (Stage 2)
+3. Negative Test 2: Malformed / Injected Sibling Authentication Path (Stage 2)
+4. Negative Test 3: Corrupted / Invalid Post-Quantum Signature (Stage 4)
+5. Negative Test 4: Substituted Merkle Root Attack (Stage 3/4)
+6. Negative Test 5: Cross-Credential Attribute Splicing (Mix-and-Match Attack, Stage 3)
+7. Negative Test 6: Revoked Credential Presentation Circumvention (Stage 1)
+8. Presentation Unlinkability & Entropy Audit (CSPRNG Salts)
+9. Presentation Replay Protection & Verifier Nonce Verification (Stage 0)
+10. Negative Test 7: Untrusted Issuer DID or Substituted Public Key (Stage 2)
+11. Authenticated Credential Envelope Verification (Message M Domain Separation)
+12. Worked Synthetic Credential Specification & Deterministic Tree Trace
+13. Classical Baseline Comparison (ECDSA secp256k1)
 """
 
 import copy
 import hashlib
 from django.test import TestCase
 
-from core_identity.models import DIDRegistry, IssuedCredential
+from core_identity.models import DIDRegistry, IssuedCredential, VerifierNonce
 from core_identity.crypto_service import PQCService, ECDSABaselineService
-from core_identity.merkle_engine import SelectiveDisclosureEngine, hash_leaf
+from core_identity.merkle_engine import (
+    SelectiveDisclosureEngine,
+    hash_leaf,
+    compute_authenticated_envelope_message,
+    build_replay_protection_token,
+    verify_replay_protection_token,
+)
 from core_identity.services.issuer_service import IssuerService
 from core_identity.services.credential_service import CredentialService
 from core_identity.services.verification_service import VerificationService
@@ -31,7 +41,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
     """
 
     def setUp(self):
-        # 1. Setup ML-DSA-65 Authority
+        # 1. Setup ML-DSA-65 Authority (NIST FIPS 204)
         self.pqc_issuer, self.pqc_keypair = IssuerService.initialize_issuer(
             scheme="ML-DSA-65 (NIST FIPS 204)",
             entity_name="National Identity Management Commission (NIMC Simulator)"
@@ -65,7 +75,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
             "residence": "Maitama, Abuja"
         }
 
-        # Issue primary credential
+        # Issue primary credential (FIPS 204 ML-DSA-65)
         self.cred_pqc = CredentialService.issue_credential(
             issuer=self.pqc_issuer,
             subject_did="did:xeno:subject:001",
@@ -100,6 +110,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
             signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=proof_packet["disclosed_claims"],
@@ -114,7 +125,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
 
     def test_02_negative_tampered_disclosed_leaf_value(self):
         """
-        Negative Test: Altering 1 byte in a revealed attribute value must be rejected at Stage 2.
+        Negative Test: Altering 1 byte in a revealed attribute value must be rejected at Stage 3.
         """
         proof_packet = VerificationService.generate_disclosure_proof(
             credential=self.credential_obj,
@@ -126,6 +137,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
             signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=tampered_claims,
@@ -151,6 +163,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
             signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=corrupted_claims,
@@ -162,7 +175,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
 
     def test_04_negative_corrupted_post_quantum_signature(self):
         """
-        Negative Test: An altered or invalid ML-DSA-65 signature must fail at Stage 3.
+        Negative Test: An altered or invalid ML-DSA-65 signature must fail at Stage 4.
         """
         proof_packet = VerificationService.generate_disclosure_proof(
             credential=self.credential_obj,
@@ -176,6 +189,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
             signature_b64=tampered_sig,
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=proof_packet["disclosed_claims"],
@@ -199,6 +213,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=substituted_root,
             signature_b64=proof_packet["signature_b64"],  # Signed over root 1, not root 2
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=proof_packet["disclosed_claims"],
@@ -229,6 +244,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_1["merkle_root"],
             signature_b64=proof_1["signature_b64"],
+            issuer_did=proof_1["issuer_did"],
             issuer_pk_b64=proof_1["issuer_public_key_b64"],
             signature_scheme=proof_1["signature_scheme"],
             disclosed_claims=spliced_claims,
@@ -257,6 +273,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
             signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
             issuer_pk_b64=proof_packet["issuer_public_key_b64"],
             signature_scheme=proof_packet["signature_scheme"],
             disclosed_claims=proof_packet["disclosed_claims"],
@@ -295,38 +312,208 @@ class XenoverifyCryptographicTestSuite(TestCase):
         self.assertNotEqual(leaf_a["leaf_hash"], leaf_b["leaf_hash"])
         self.assertNotEqual(cred_a["merkle_root"], cred_b["merkle_root"])
 
-    def test_08_worked_synthetic_credential_specification_and_replay_layer(self):
+    def test_09_verifier_nonce_replay_protection_defense(self):
+        """
+        Validates verifier challenge nonce generation, presentation token binding,
+        and ensures that replayed presentations are detected and rejected at Stage 0.
+        """
+        # Step 1: Relying party generates a fresh challenge nonce
+        nonce_packet = VerificationService.create_verifier_nonce(validity_seconds=300)
+        nonce = nonce_packet["verifier_nonce"]
+
+        # Step 2: Holder extracts proof packet bound to this nonce
+        proof_packet = VerificationService.generate_disclosure_proof(
+            credential=self.credential_obj,
+            disclosed_keys=["fullName", "nationality"],
+            verifier_nonce=nonce
+        )
+        self.assertIsNotNone(proof_packet["replay_token"])
+
+        # Step 3: First verification attempt succeeds
+        result1 = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            verifier_nonce=proof_packet["verifier_nonce"],
+            timestamp_iso=proof_packet["timestamp_iso"],
+            replay_token=proof_packet["replay_token"]
+        )
+        self.assertTrue(result1["valid"])
+
+        # Step 4: Replay attack: Adversary presents the exact same presentation packet again
+        result2 = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            verifier_nonce=proof_packet["verifier_nonce"],
+            timestamp_iso=proof_packet["timestamp_iso"],
+            replay_token=proof_packet["replay_token"]
+        )
+        self.assertFalse(result2["valid"])
+        self.assertEqual(result2["error_stage"], "REPLAY_PROTECTION")
+        self.assertIn("already consumed", result2["error"])
+
+        # Step 5: Modified challenge nonce mismatch
+        result3 = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            verifier_nonce="forged_nonce_12345",
+            timestamp_iso=proof_packet["timestamp_iso"],
+            replay_token=proof_packet["replay_token"]
+        )
+        self.assertFalse(result3["valid"])
+        self.assertEqual(result3["error_stage"], "REPLAY_PROTECTION")
+
+    def test_10_negative_unregistered_or_substituted_issuer_key(self):
+        """
+        Negative Test: Verifier must independently check the Issuer Registry (Stage 2).
+        If the presenter supplies an unregistered issuer DID or substitutes their own public key,
+        verification must halt at Stage 2.
+        """
+        proof_packet = VerificationService.generate_disclosure_proof(
+            credential=self.credential_obj,
+            disclosed_keys=["fullName"]
+        )
+
+        # Attack A: Presenter provides an unknown / fabricated issuer DID
+        res_unknown_did = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did="did:xeno:unregistered:rogue_authority",
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            require_registry_check=True
+        )
+        self.assertFalse(res_unknown_did["valid"])
+        self.assertEqual(res_unknown_did["error_stage"], "ISSUER_REGISTRY_VERIFICATION")
+        self.assertIn("not registered", res_unknown_did["error"])
+
+        # Attack B: Presenter supplies valid issuer DID but substitutes their own public key
+        rogue_keypair = PQCService.generate_keypair()
+        res_substituted_key = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=self.pqc_issuer.did,
+            issuer_pk_b64=rogue_keypair["public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            require_registry_check=True
+        )
+        self.assertFalse(res_substituted_key["valid"])
+        self.assertEqual(res_substituted_key["error_stage"], "ISSUER_REGISTRY_VERIFICATION")
+        self.assertIn("does not match the anchored public key", res_substituted_key["error"])
+
+    def test_11_authenticated_credential_envelope_verification(self):
+        """
+        Validates issuance and selective disclosure using domain-separated Authenticated
+        Credential Envelope Message M (Section 2.2):
+        M = SHA-256( schema_id || ':' || issuer_did || ':' || credential_id || ':' || subject_did || ':' || R )
+        """
+        cred_envelope = CredentialService.issue_credential(
+            issuer=self.pqc_issuer,
+            subject_did="did:xeno:subject:envelope_test",
+            attributes=self.attributes_1,
+            secret_key_b64=self.pqc_secret_key,
+            bind_envelope=True
+        )
+        self.assertEqual(cred_envelope["signed_target"], "AUTHENTICATED_ENVELOPE")
+        self.assertIsNotNone(cred_envelope["envelope_message"])
+        self.assertEqual(len(cred_envelope["envelope_message"]), 64)
+
+        cred_obj = IssuedCredential.objects.get(id=cred_envelope["credential_id"])
+        proof_packet = VerificationService.generate_disclosure_proof(
+            credential=cred_obj,
+            disclosed_keys=["fullName", "residence"]
+        )
+
+        # Successful verification validates envelope message M
+        result = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            subject_did=proof_packet["subject_did"],
+            schema_id=proof_packet["schema_id"]
+        )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["verified_target"], "AUTHENTICATED_ENVELOPE")
+
+        # Negative check: tampering subject_did alters envelope message M and fails verification
+        tampered_result = VerificationService.verify_proof_package(
+            merkle_root=proof_packet["merkle_root"],
+            signature_b64=proof_packet["signature_b64"],
+            issuer_did=proof_packet["issuer_did"],
+            issuer_pk_b64=proof_packet["issuer_public_key_b64"],
+            signature_scheme=proof_packet["signature_scheme"],
+            disclosed_claims=proof_packet["disclosed_claims"],
+            credential_id=proof_packet["credential_id"],
+            subject_did="did:xeno:subject:altered_attacker",
+            schema_id=proof_packet["schema_id"]
+        )
+        self.assertFalse(tampered_result["valid"])
+        self.assertEqual(tampered_result["error_stage"], "CRYPTOGRAPHIC_SIGNATURE_VERIFICATION")
+
+    def test_12_worked_synthetic_credential_specification(self):
         """
         Validates worked synthetic credential construction, exact leaf hashes,
-        canonical root synthesis, and presentation-layer replay protection token.
+        canonical root synthesis, and authenticated envelope message M.
+        Verifies exact match with Section 1 and Section 2 worked example.
         """
-        from core_identity.merkle_engine import build_replay_protection_token, verify_replay_protection_token
         worked = SelectiveDisclosureEngine.generate_worked_synthetic_credential()
 
         self.assertEqual(len(worked["leaves"]), 6)
-        # Check deterministic root
+        # Deterministic Merkle Root R
         self.assertEqual(worked["merkle_root"], "072e0695d79904e2c03e988f2ee5a9cac2d2af3b364f6367b4674f58323b39f3")
-        # Check authenticated envelope message M
+        # Deterministic Authenticated Envelope Message M
         self.assertEqual(worked["authenticated_message_m"], "e6c6552aa606c85e75badb479a8be11953c97d34f7fbf0c62792702ab58c0e2c")
 
-        # Replay token test
-        token = build_replay_protection_token(
-            credential_id=worked["credential_id"],
-            verifier_nonce="test-nonce-12345",
-            timestamp_iso="2026-10-17T12:00:00Z",
-            disclosed_keys=["fullName", "nationality"]
+    def test_13_classical_ecdsa_baseline_verification(self):
+        """
+        Validates classical ECDSA secp256k1 baseline issuance and selective disclosure.
+        Validates that classical ECDSA signatures are 71 bytes (vs 3,309 bytes for ML-DSA-65).
+        """
+        cred_ecdsa = CredentialService.issue_credential(
+            issuer=self.ecdsa_issuer,
+            subject_did="did:xeno:subject:classical_001",
+            attributes=self.attributes_1,
+            secret_key_b64=self.ecdsa_secret_key
         )
-        self.assertTrue(verify_replay_protection_token(
-            token=token,
-            credential_id=worked["credential_id"],
-            verifier_nonce="test-nonce-12345",
-            timestamp_iso="2026-10-17T12:00:00Z",
-            disclosed_keys=["fullName", "nationality"]
-        ))
-        self.assertFalse(verify_replay_protection_token(
-            token=token,
-            credential_id=worked["credential_id"],
-            verifier_nonce="replayed-nonce-diff",
-            timestamp_iso="2026-10-17T12:00:00Z",
-            disclosed_keys=["fullName", "nationality"]
-        ))
+        self.assertIn("ECDSA", cred_ecdsa["signature_scheme"])
+        self.assertLessEqual(cred_ecdsa["signature_bytes"], 72)
+
+        cred_obj = IssuedCredential.objects.get(id=cred_ecdsa["credential_id"])
+        proof = VerificationService.generate_disclosure_proof(
+            credential=cred_obj,
+            disclosed_keys=["fullName"]
+        )
+
+        result = VerificationService.verify_proof_package(
+            merkle_root=proof["merkle_root"],
+            signature_b64=proof["signature_b64"],
+            issuer_did=proof["issuer_did"],
+            issuer_pk_b64=proof["issuer_public_key_b64"],
+            signature_scheme=proof["signature_scheme"],
+            disclosed_claims=proof["disclosed_claims"],
+            credential_id=proof["credential_id"]
+        )
+        self.assertTrue(result["valid"])
+        self.assertEqual(result["status"], "CRYPTOGRAPHICALLY_VERIFIED")

@@ -46,7 +46,7 @@ def compute_authenticated_envelope_message(
     credential_id: str,
     subject_did: str,
     merkle_root: str,
-    schema_id: str = "urn:xeno:schema:identity-credential:v1"
+    schema_id: str = "urn:xeno:schema:id-credential:v1"
 ) -> Tuple[str, bytes]:
     """
     Domain-Separated Authenticated Credential Envelope Message M.

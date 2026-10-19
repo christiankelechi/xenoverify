@@ -1,7 +1,7 @@
 """
 Post-Quantum Cryptographic Service & Classical Baseline Comparison Module.
 Implements:
-1. NIST FIPS 204 ML-DSA-65 (Module-Lattice-Based Digital Signature Algorithm - Dilithium3)
+1. NIST FIPS 204 ML-DSA-65 (Module-Lattice-Based Digital Signature Algorithm)
 2. Classical Baseline: ECDSA over secp256k1 (with SHA-256)
 Author: Xenoverify Team (Academic Research Prototype aligned with Chapter 3 DSRM)
 """
@@ -10,7 +10,7 @@ import time
 import os
 import base64
 from typing import Dict, Any, Tuple
-from dilithium_py.dilithium import Dilithium3
+from dilithium_py.ml_dsa import ML_DSA_65
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives import serialization
@@ -19,21 +19,28 @@ from cryptography.exceptions import InvalidSignature
 
 class PQCService:
     """
-    ML-DSA-65 Cryptographic Engine (NIST FIPS 204 standard).
+    ML-DSA-65 Cryptographic Engine (NIST FIPS 204 final standard).
     Provides post-quantum keypair generation, message signing, and signature verification.
+    Uses native FIPS 204 parameters:
+      - Public Key: 1,952 bytes
+      - Secret Key: 4,032 bytes
+      - Signature: 3,309 bytes
     """
 
-    SCHEME_NAME = "ML-DSA-65 (NIST FIPS 204 / Dilithium3)"
+    SCHEME_NAME = "ML-DSA-65 (NIST FIPS 204)"
     SECURITY_LEVEL = "NIST Security Category 3 (Lattice-based hard problems / Module-LWE)"
+    FIPS204_PK_BYTES = 1952
+    FIPS204_SK_BYTES = 4032
+    FIPS204_SIG_BYTES = 3309
 
     @classmethod
     def generate_keypair(cls) -> Dict[str, Any]:
         """
-        Generate ML-DSA-65 public and private keypair.
+        Generate ML-DSA-65 public and private keypair per NIST FIPS 204.
         Returns base64 encoded keys along with raw byte metrics.
         """
         t0 = time.perf_counter()
-        pk, sk = Dilithium3.keygen()
+        pk, sk = ML_DSA_65.keygen()
         t1 = time.perf_counter()
         keygen_time_ms = (t1 - t0) * 1000
 
@@ -46,60 +53,50 @@ class PQCService:
             "keygen_time_ms": round(keygen_time_ms, 3)
         }
 
-    FIPS204_SIG_BYTES = 3309
-    ROUND3_SIG_BYTES = 3293
-    FIPS204_CONTEXT_PAD = 16  # 16-byte FIPS 204 wire serialization wrapper
-
     @classmethod
     def sign(cls, message_bytes: bytes, secret_key_b64: str) -> Dict[str, Any]:
         """
-        Sign arbitrary payload (e.g., Merkle Root digest) with ML-DSA-65.
-        Formats signature into canonical NIST FIPS 204 wire format (3,309 bytes).
+        Sign arbitrary payload (e.g., Merkle Root digest or Authenticated Envelope Message M)
+        with ML-DSA-65. Generates canonical NIST FIPS 204 signature (3,309 bytes).
         """
         sk = base64.b64decode(secret_key_b64)
         t0 = time.perf_counter()
-        raw_sig = Dilithium3.sign(sk, message_bytes)
+        signature = ML_DSA_65.sign(sk, message_bytes)
         t1 = time.perf_counter()
         sign_time_ms = (t1 - t0) * 1000
 
-        # NIST FIPS 204 serialization wrapper (3,309 bytes canonical wire format)
-        fips204_signature = raw_sig + (b"\x00" * cls.FIPS204_CONTEXT_PAD)
-
         return {
-            "signature_b64": base64.b64encode(fips204_signature).decode("utf-8"),
-            "signature_bytes": len(fips204_signature),
+            "signature_b64": base64.b64encode(signature).decode("utf-8"),
+            "signature_bytes": len(signature),
             "sign_time_ms": round(sign_time_ms, 3)
         }
 
     @classmethod
     def verify(cls, message_bytes: bytes, signature_b64: str, public_key_b64: str) -> Dict[str, Any]:
         """
-        Verify signature against message using ML-DSA-65 public key.
-        Supports NIST FIPS 204 wire format (3,309 bytes) and raw Round 3 format (3,293 bytes).
+        Verify signature against message using ML-DSA-65 public key per NIST FIPS 204.
+        Validates public key size (1,952 bytes) and signature size (3,309 bytes).
         """
         try:
             pk = base64.b64decode(public_key_b64)
             signature = base64.b64decode(signature_b64)
 
-            if len(signature) == cls.FIPS204_SIG_BYTES:
-                if signature[cls.ROUND3_SIG_BYTES:] != (b"\x00" * cls.FIPS204_CONTEXT_PAD):
-                    return {
-                        "valid": False,
-                        "verify_time_ms": 0.0,
-                        "error": "FIPS 204 context trailer integrity violation"
-                    }
-                raw_sig = signature[:cls.ROUND3_SIG_BYTES]
-            elif len(signature) == cls.ROUND3_SIG_BYTES:
-                raw_sig = signature
-            else:
+            if len(pk) != cls.FIPS204_PK_BYTES:
                 return {
                     "valid": False,
                     "verify_time_ms": 0.0,
-                    "error": f"Invalid ML-DSA-65 signature length: {len(signature)} bytes (expected {cls.FIPS204_SIG_BYTES} bytes)"
+                    "error": f"Invalid ML-DSA-65 public key length: {len(pk)} bytes (expected {cls.FIPS204_PK_BYTES} bytes per NIST FIPS 204)"
+                }
+
+            if len(signature) != cls.FIPS204_SIG_BYTES:
+                return {
+                    "valid": False,
+                    "verify_time_ms": 0.0,
+                    "error": f"Invalid ML-DSA-65 signature length: {len(signature)} bytes (expected {cls.FIPS204_SIG_BYTES} bytes per NIST FIPS 204)"
                 }
 
             t0 = time.perf_counter()
-            is_valid = Dilithium3.verify(pk, message_bytes, raw_sig)
+            is_valid = ML_DSA_65.verify(pk, message_bytes, signature)
             t1 = time.perf_counter()
             verify_time_ms = (t1 - t0) * 1000
             return {

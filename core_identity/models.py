@@ -30,11 +30,15 @@ class DIDRegistry(models.Model):
 class IssuedCredential(models.Model):
     """
     Represents an issued Verifiable Digital Credential.
+    Encapsulates Salted Merkle Root commitment and Post-Quantum / Classical signature,
+    along with the Authenticated Credential Envelope message M.
     """
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     subject_did = models.CharField(max_length=128)
     issuer = models.ForeignKey(DIDRegistry, on_delete=models.CASCADE, related_name="issued_credentials")
+    schema_id = models.CharField(max_length=128, default="urn:xeno:schema:id-credential:v1")
     merkle_root = models.CharField(max_length=64, db_index=True)
+    envelope_message = models.CharField(max_length=64, blank=True, null=True, help_text="Authenticated Credential Envelope digest M")
     signature_scheme = models.CharField(max_length=64, default="ML-DSA-65")
     signature_b64 = models.TextField()
     signature_bytes = models.IntegerField(default=3309)
@@ -47,6 +51,22 @@ class IssuedCredential(models.Model):
 
     def __str__(self):
         return f"Cred {self.id} for {self.subject_did} (Root: {self.merkle_root[:8]}...)"
+
+
+class VerifierNonce(models.Model):
+    """
+    Simulated Verifier Nonce Store for Presentation Replay Attack Defense.
+    Nonces are bound to challenge-response sessions with 300-second TTL.
+    Once verified, a nonce is marked consumed to prevent eavesdropped presentations.
+    """
+    nonce = models.CharField(max_length=128, primary_key=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    is_consumed = models.BooleanField(default=False)
+    consumed_at = models.DateTimeField(blank=True, null=True)
+
+    def __str__(self):
+        return f"Nonce {self.nonce} (consumed={self.is_consumed})"
 
 
 class EvaluationLog(models.Model):
