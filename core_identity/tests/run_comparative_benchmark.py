@@ -74,7 +74,7 @@ def run_comparative_benchmark(iterations=50, warmup=5):
 
     # Standard worked synthetic credential attributes
     attributes = {
-        "fullName": "Olushola James",
+        "fullName": "Alex Carter",
         "nin": "29837492812",
         "dob": "1992-06-14",
         "nationality": "Nigerian",

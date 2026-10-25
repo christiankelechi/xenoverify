@@ -57,7 +57,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
 
         # Synthetic applicant attributes
         self.attributes_1 = {
-            "fullName": "Olushola James",
+            "fullName": "Alex Carter",
             "nin": "29837492812",
             "dob": "1992-06-14",
             "nationality": "Nigerian",
@@ -132,7 +132,7 @@ class XenoverifyCryptographicTestSuite(TestCase):
             disclosed_keys=["fullName", "nationality"]
         )
         tampered_claims = copy.deepcopy(proof_packet["disclosed_claims"])
-        tampered_claims[0]["value"] = "Olushola James_TAMPERED"
+        tampered_claims[0]["value"] = "Alex Carter_TAMPERED"
 
         result = VerificationService.verify_proof_package(
             merkle_root=proof_packet["merkle_root"],
@@ -482,9 +482,9 @@ class XenoverifyCryptographicTestSuite(TestCase):
 
         self.assertEqual(len(worked["leaves"]), 6)
         # Deterministic Merkle Root R
-        self.assertEqual(worked["merkle_root"], "072e0695d79904e2c03e988f2ee5a9cac2d2af3b364f6367b4674f58323b39f3")
+        self.assertEqual(worked["merkle_root"], "e44710fed7f939569fd05f05d57401f7f4e50d2696d378370c603ecb8379739c")
         # Deterministic Authenticated Envelope Message M
-        self.assertEqual(worked["authenticated_message_m"], "e6c6552aa606c85e75badb479a8be11953c97d34f7fbf0c62792702ab58c0e2c")
+        self.assertEqual(worked["authenticated_message_m"], "bf243e9f3af4e8f36a56faab77ae5eecf0aa16f57c21f0892e6129f944cfbc01")
 
     def test_13_classical_ecdsa_baseline_verification(self):
         """

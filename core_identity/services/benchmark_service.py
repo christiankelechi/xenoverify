@@ -15,7 +15,7 @@ class BenchmarkService:
     """
 
     DEFAULT_ATTRIBUTES = {
-        "fullName": "Olushola James",
+        "fullName": "Alex Carter",
         "nin": "28374928192",
         "dob": "1993-08-20",
         "nationality": "Nigerian",

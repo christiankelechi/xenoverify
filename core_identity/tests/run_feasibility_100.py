@@ -90,7 +90,7 @@ def run_feasibility_protocol(num_trials=100, output_csv=None):
 
     # Synthetic applicant attributes
     attributes = {
-        "fullName": "Olushola James",
+        "fullName": "Alex Carter",
         "nin": "29837492812",
         "dob": "1992-06-14",
         "nationality": "Nigerian",
