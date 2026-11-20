@@ -14,9 +14,11 @@ import secrets
 from datetime import timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from django.utils import timezone
+from django.core.exceptions import ValidationError
 
 from core_identity.models import DIDRegistry, IssuedCredential, VerifierNonce
 from core_identity.merkle_engine import (
+    PROTOCOL_VERSION,
     SelectiveDisclosureEngine,
     compute_authenticated_envelope_message,
     build_replay_protection_token,
@@ -56,7 +58,8 @@ class VerificationService:
         cls,
         credential: IssuedCredential,
         disclosed_keys: List[str],
-        verifier_nonce: Optional[str] = None
+        verifier_nonce: Optional[str] = None,
+        include_issuer_public_key: bool = True
     ) -> Dict[str, Any]:
         """
         Extracts Merkle inclusion path for chosen claims while withholding unselected attributes.
@@ -79,11 +82,11 @@ class VerificationService:
                 disclosed_keys=disclosed_keys
             )
 
-        return {
+        packet = {
+            "protocol_version": PROTOCOL_VERSION,
             "credential_id": str(credential.id),
             "subject_did": credential.subject_did,
             "issuer_did": credential.issuer.did,
-            "issuer_public_key_b64": credential.issuer.public_key_b64,
             "schema_id": getattr(credential, "schema_id", "urn:xeno:schema:id-credential:v1"),
             "merkle_root": credential.merkle_root,
             "envelope_message": getattr(credential, "envelope_message", None),
@@ -98,6 +101,9 @@ class VerificationService:
             "replay_token": replay_token,
             "proof_generation_time_ms": round(generation_time_ms, 3)
         }
+        if include_issuer_public_key:
+            packet["issuer_public_key_b64"] = credential.issuer.public_key_b64
+        return packet
 
     @classmethod
     def verify_proof_package(
@@ -114,26 +120,73 @@ class VerificationService:
         verifier_nonce: Optional[str] = None,
         timestamp_iso: Optional[str] = None,
         replay_token: Optional[str] = None,
-        require_registry_check: bool = True
+        require_registry_check: bool = True,
+        envelope_required: bool = True,
+        require_nonce: bool = True,
+        require_replay_token: bool = True
     ) -> Dict[str, Any]:
         """
-        Executes complete 5-stage verification pipeline:
-        Stage 0: Replay Protection & Verifier Nonce Validation
-        Stage 1: Ledger Revocation Check
+        Executes complete fail-closed 5-stage verification pipeline (Protocol xeno-merkle-mldsa-v2):
+        Stage 0: Replay Protection & Verifier Nonce Validation (atomic early consumption)
+        Stage 1: Revocation Check against Simulated Ledger
         Stage 2: Independent Issuer Registry Resolution & Public Key Authentication
-        Stage 3: Merkle Tree Inclusion Proof Verification
-        Stage 4: NIST FIPS 204 ML-DSA-65 Post-Quantum Signature Verification
+        Stage 3: Domain-Separated Salted Merkle Tree Inclusion Proof Verification
+        Stage 4: NIST FIPS 204 ML-DSA-65 Signature Verification on Authenticated Envelope M
         """
         t0 = time.perf_counter()
         disclosed_claims = disclosed_claims or []
-        disclosed_keys = [c.get("key") for c in disclosed_claims if isinstance(c, dict) and "key" in c]
+        disclosed_keys = [c.get("key") for c in disclosed_claims if isinstance(c, dict) and isinstance(c.get("key"), str)]
 
         # ---------------------------------------------------------
         # STAGE 0: Presentation Replay Protection & Nonce Validation
         # ---------------------------------------------------------
-        if verifier_nonce:
-            # Check cryptographic replay token challenge binding if provided
-            if replay_token:
+        if not verifier_nonce:
+            if require_nonce:
+                return {
+                    "valid": False,
+                    "error_stage": "REPLAY_PROTECTION",
+                    "error": "Missing mandatory verifier challenge nonce in presentation payload"
+                }
+        else:
+            now = timezone.now()
+            # Conditional atomic UPDATE prevents concurrent double-spend race on VerifierNonce.
+            # Trade-off (documented): Stage 0 consumes the nonce prior to Stage 3/4 signature checks,
+            # so an invalid presentation consumes that single-use challenge and requires a fresh nonce.
+            updated = VerifierNonce.objects.filter(
+                nonce=verifier_nonce,
+                is_consumed=False,
+                expires_at__gt=now
+            ).update(is_consumed=True, consumed_at=now)
+
+            if updated == 0:
+                nonce_obj = VerifierNonce.objects.filter(nonce=verifier_nonce).first()
+                if not nonce_obj:
+                    return {
+                        "valid": False,
+                        "error_stage": "REPLAY_PROTECTION",
+                        "error": f"Invalid challenge nonce: verifier challenge nonce '{verifier_nonce}' not found or unissued"
+                    }
+                if nonce_obj.is_consumed:
+                    return {
+                        "valid": False,
+                        "error_stage": "REPLAY_PROTECTION",
+                        "error": f"Replay attack detected: verifier challenge nonce '{verifier_nonce}' already consumed"
+                    }
+                return {
+                    "valid": False,
+                    "error_stage": "REPLAY_PROTECTION",
+                    "error": "Verifier challenge nonce has expired"
+                }
+
+            # Check cryptographic replay token challenge binding
+            if not replay_token:
+                if require_replay_token:
+                    return {
+                        "valid": False,
+                        "error_stage": "REPLAY_PROTECTION",
+                        "error": "Missing mandatory replay protection token for verifier challenge binding"
+                    }
+            else:
                 valid_token = verify_replay_protection_token(
                     token=replay_token,
                     credential_id=credential_id or "",
@@ -147,26 +200,6 @@ class VerificationService:
                         "error_stage": "REPLAY_PROTECTION",
                         "error": "Replay protection token invalid: challenge nonce, timestamp, or disclosed claim mismatch"
                     }
-
-            # Check database-anchored verifier challenge nonce single-use consumption
-            nonce_obj = VerifierNonce.objects.filter(nonce=verifier_nonce).first()
-            if nonce_obj:
-                if nonce_obj.is_consumed:
-                    return {
-                        "valid": False,
-                        "error_stage": "REPLAY_PROTECTION",
-                        "error": f"Replay attack detected: verifier challenge nonce '{verifier_nonce}' already consumed"
-                    }
-                if timezone.now() > nonce_obj.expires_at:
-                    return {
-                        "valid": False,
-                        "error_stage": "REPLAY_PROTECTION",
-                        "error": "Verifier challenge nonce has expired"
-                    }
-                # Mark nonce consumed to prevent subsequent replay
-                nonce_obj.is_consumed = True
-                nonce_obj.consumed_at = timezone.now()
-                nonce_obj.save(update_fields=["is_consumed", "consumed_at"])
 
         # ---------------------------------------------------------
         # STAGE 1: Revocation Accumulator Check (Simulated Ledger)
@@ -187,56 +220,37 @@ class VerificationService:
                     subject_did = cred.subject_did
                 if not schema_id:
                     schema_id = cred.schema_id
-            except (IssuedCredential.DoesNotExist, ValueError):
+            except (IssuedCredential.DoesNotExist, ValueError, ValidationError):
                 cred = None
 
         # ---------------------------------------------------------
         # STAGE 2: Independent Issuer Registry Resolution & Authentication
         # ---------------------------------------------------------
-        trusted_pk_b64 = None
-        resolved_scheme = signature_scheme
-
-        if issuer_did:
-            issuer_record = DIDRegistry.objects.filter(did=issuer_did, is_active=True).first()
-            if not issuer_record:
-                return {
-                    "valid": False,
-                    "error_stage": "ISSUER_REGISTRY_VERIFICATION",
-                    "error": f"Untrusted issuer: DID '{issuer_did}' not registered or inactive in DID Registry"
-                }
-            # Crucial Security Check: Presenter must not substitute their own public key
-            if issuer_pk_b64 and issuer_pk_b64 != issuer_record.public_key_b64:
-                return {
-                    "valid": False,
-                    "error_stage": "ISSUER_REGISTRY_VERIFICATION",
-                    "error": "Presented public key does not match the anchored public key in DID Registry (Key substitution rejected)"
-                }
-            trusted_pk_b64 = issuer_record.public_key_b64
-            resolved_scheme = issuer_record.scheme
-        elif cred is not None:
-            trusted_pk_b64 = cred.issuer.public_key_b64
-            resolved_scheme = cred.issuer.scheme
-            if issuer_pk_b64 and issuer_pk_b64 != trusted_pk_b64:
-                return {
-                    "valid": False,
-                    "error_stage": "ISSUER_REGISTRY_VERIFICATION",
-                    "error": "Presented public key does not match the anchored public key in DID Registry (Key substitution rejected)"
-                }
-        else:
-            if require_registry_check and not issuer_pk_b64:
-                return {
-                    "valid": False,
-                    "error_stage": "ISSUER_REGISTRY_VERIFICATION",
-                    "error": "Issuer DID missing or not anchored in DID Registry. Verifier cannot independently validate public key authority."
-                }
-            trusted_pk_b64 = issuer_pk_b64
-
-        if not trusted_pk_b64:
+        if not issuer_did:
             return {
                 "valid": False,
                 "error_stage": "ISSUER_REGISTRY_VERIFICATION",
-                "error": "No verified issuer public key available for cryptographic evaluation"
+                "error": "Missing mandatory issuer DID: verifier cannot independently resolve public key authority"
             }
+
+        issuer_record = DIDRegistry.objects.filter(did=issuer_did, is_active=True).first()
+        if not issuer_record:
+            return {
+                "valid": False,
+                "error_stage": "ISSUER_REGISTRY_VERIFICATION",
+                "error": f"Untrusted issuer: DID '{issuer_did}' not registered or inactive in DID Registry"
+            }
+
+        # Crucial Security Check: Presenter must not substitute their own public key
+        if issuer_pk_b64 and issuer_pk_b64 != issuer_record.public_key_b64:
+            return {
+                "valid": False,
+                "error_stage": "ISSUER_REGISTRY_VERIFICATION",
+                "error": "Presented public key does not match the anchored public key in DID Registry (Key substitution rejected)"
+            }
+
+        trusted_pk_b64 = issuer_record.public_key_b64
+        resolved_scheme = issuer_record.scheme
 
         # ---------------------------------------------------------
         # STAGE 3: Merkle Inclusion Proof Reconciliation
@@ -261,32 +275,61 @@ class VerificationService:
         verified_target = None
         sig_error = None
 
-        # Build candidate payloads to verify:
-        # Candidate A: Authenticated Credential Envelope message M (Section 2.2)
-        # Candidate B: Raw Merkle Root digest R (Section 2.1)
-        candidates = []
-        if credential_id and subject_did and issuer_did:
-            m_digest, _ = compute_authenticated_envelope_message(
-                issuer_did=issuer_did,
-                credential_id=str(credential_id),
-                subject_did=subject_did,
-                merkle_root=merkle_root,
-                schema_id=schema_id or "urn:xeno:schema:id-credential:v1"
-            )
-            candidates.append(("AUTHENTICATED_ENVELOPE", m_digest.encode("utf-8")))
-        candidates.append(("MERKLE_ROOT", merkle_root.encode("utf-8")))
-
-        for target_name, payload_bytes in candidates:
+        if envelope_required:
+            if not (credential_id and subject_did and issuer_did and schema_id):
+                return {
+                    "valid": False,
+                    "error_stage": "CRYPTOGRAPHIC_SIGNATURE_VERIFICATION",
+                    "error": "Envelope verification required but missing credential metadata (schema_id, credential_id, subject_did, or issuer_did)"
+                }
+            try:
+                m_digest, _ = compute_authenticated_envelope_message(
+                    issuer_did=issuer_did,
+                    credential_id=str(credential_id),
+                    subject_did=subject_did,
+                    merkle_root=merkle_root,
+                    schema_id=schema_id
+                )
+            except ValueError as exc:
+                return {
+                    "valid": False,
+                    "error_stage": "CRYPTOGRAPHIC_SIGNATURE_VERIFICATION",
+                    "error": f"Malformed envelope metadata: {exc}"
+                }
+            payload_bytes = m_digest.encode("utf-8")
             if "ECDSA" in resolved_scheme:
                 res = ECDSABaselineService.verify(payload_bytes, signature_b64, trusted_pk_b64)
             else:
                 res = PQCService.verify(payload_bytes, signature_b64, trusted_pk_b64)
 
             if res["valid"]:
-                verified_target = target_name
-                break
+                verified_target = "AUTHENTICATED_ENVELOPE"
             else:
-                sig_error = res.get("error")
+                sig_error = f"Signature verification failed against Authenticated Credential Envelope: {res.get('error', 'invalid signature')}"
+        else:
+            candidates = []
+            if credential_id and subject_did and issuer_did:
+                m_digest, _ = compute_authenticated_envelope_message(
+                    issuer_did=issuer_did,
+                    credential_id=str(credential_id),
+                    subject_did=subject_did,
+                    merkle_root=merkle_root,
+                    schema_id=schema_id or "urn:xeno:schema:id-credential:v1"
+                )
+                candidates.append(("AUTHENTICATED_ENVELOPE", m_digest.encode("utf-8")))
+            candidates.append(("MERKLE_ROOT", merkle_root.encode("utf-8")))
+
+            for target_name, payload_bytes in candidates:
+                if "ECDSA" in resolved_scheme:
+                    res = ECDSABaselineService.verify(payload_bytes, signature_b64, trusted_pk_b64)
+                else:
+                    res = PQCService.verify(payload_bytes, signature_b64, trusted_pk_b64)
+
+                if res["valid"]:
+                    verified_target = target_name
+                    break
+                else:
+                    sig_error = res.get("error")
 
         t_s_ms = (time.perf_counter() - t_s0) * 1000
 
@@ -302,6 +345,7 @@ class VerificationService:
         total_verification_time_ms = (time.perf_counter() - t0) * 1000
 
         return {
+            "protocol_version": PROTOCOL_VERSION,
             "valid": True,
             "status": "CRYPTOGRAPHICALLY_VERIFIED",
             "verified_target": verified_target,

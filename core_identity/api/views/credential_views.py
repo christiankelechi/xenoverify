@@ -52,12 +52,16 @@ class IssueCredentialView(BaseAPIView):
             if not secret_key_b64:
                 secret_key_b64 = fallback_sk
 
-        credential_data = CredentialService.issue_credential(
-            issuer=issuer,
-            subject_did=subject_did,
-            attributes=attributes,
-            secret_key_b64=secret_key_b64
-        )
+        try:
+            credential_data = CredentialService.issue_credential(
+                issuer=issuer,
+                subject_did=subject_did,
+                attributes=attributes,
+                secret_key_b64=secret_key_b64,
+                bind_envelope=True
+            )
+        except ValueError as exc:
+            return self.error_response(str(exc), status_code=status.HTTP_400_BAD_REQUEST)
 
         return self.success_response(credential_data, status_code=status.HTTP_201_CREATED)
 

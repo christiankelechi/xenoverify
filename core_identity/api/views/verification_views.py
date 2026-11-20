@@ -79,15 +79,25 @@ class VerifySelectiveDisclosureProofView(BaseAPIView):
     """
 
     @swagger_auto_schema(
-        operation_description="Cryptographically verify ML-DSA-65 signature, Merkle paths, issuer registry anchor, and replay defense.",
+        operation_description="Cryptographically verify ML-DSA-65 signature, Merkle paths, issuer registry anchor, and replay defense (fail-closed Protocol xeno-merkle-mldsa-v2).",
         request_body=openapi.Schema(
             type=openapi.TYPE_OBJECT,
-            required=["merkle_root", "signature_b64", "disclosed_claims"],
+            required=[
+                "merkle_root",
+                "signature_b64",
+                "issuer_did",
+                "credential_id",
+                "subject_did",
+                "disclosed_claims",
+                "verifier_nonce",
+                "timestamp_iso",
+                "replay_token",
+            ],
             properties={
                 "merkle_root": openapi.Schema(type=openapi.TYPE_STRING),
                 "signature_b64": openapi.Schema(type=openapi.TYPE_STRING),
                 "issuer_did": openapi.Schema(type=openapi.TYPE_STRING, description="Issuer DID in registry"),
-                "issuer_public_key_b64": openapi.Schema(type=openapi.TYPE_STRING),
+                "issuer_public_key_b64": openapi.Schema(type=openapi.TYPE_STRING, description="Optional hint validated against DIDRegistry"),
                 "signature_scheme": openapi.Schema(type=openapi.TYPE_STRING, default="ML-DSA-65"),
                 "credential_id": openapi.Schema(type=openapi.TYPE_STRING),
                 "subject_did": openapi.Schema(type=openapi.TYPE_STRING),
@@ -130,7 +140,10 @@ class VerifySelectiveDisclosureProofView(BaseAPIView):
             verifier_nonce=verifier_nonce,
             timestamp_iso=timestamp_iso,
             replay_token=replay_token,
-            require_registry_check=True
+            require_registry_check=True,
+            envelope_required=True,
+            require_nonce=True,
+            require_replay_token=True,
         )
 
         if not result["valid"]:

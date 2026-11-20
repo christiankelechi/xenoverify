@@ -8,7 +8,11 @@ from typing import Dict, Any, List
 from django.db import transaction
 
 from core_identity.models import DIDRegistry, IssuedCredential
-from core_identity.merkle_engine import SelectiveDisclosureEngine, compute_authenticated_envelope_message
+from core_identity.merkle_engine import (
+    PROTOCOL_VERSION,
+    SelectiveDisclosureEngine,
+    compute_authenticated_envelope_message,
+)
 from core_identity.crypto_service import PQCService, ECDSABaselineService
 
 
@@ -27,14 +31,14 @@ class CredentialService:
         attributes: Dict[str, Any],
         secret_key_b64: str,
         schema_id: str = "urn:xeno:schema:id-credential:v1",
-        bind_envelope: bool = False
+        bind_envelope: bool = True
     ) -> Dict[str, Any]:
         """
-        1. Salts each credential attribute with 128-bit CSPRNG.
-        2. Constructs Merkle commitment tree and computes root R.
+        1. Validates and salts each credential attribute with 128-bit CSPRNG.
+        2. Constructs domain-separated Merkle commitment tree and computes root R.
         3. Computes domain-separated Authenticated Credential Envelope message M:
-           M = SHA-256( schema_id || ':' || issuer_did || ':' || credential_id || ':' || subject_did || ':' || merkle_root )
-        4. Signs either envelope digest M (if bind_envelope=True) or Merkle root R (if bind_envelope=False)
+           M = SHA-256(0x02 || JSON([schema_id, issuer_did, credential_id, subject_did, merkle_root])).
+        4. Signs UTF-8(M) (if bind_envelope=True, default) or UTF-8(R) (legacy compatibility if bind_envelope=False)
            with issuer's algorithm (NIST FIPS 204 ML-DSA-65 or ECDSA).
         5. Persists and returns complete verifiable credential entity.
         """
@@ -43,7 +47,7 @@ class CredentialService:
         commitment = SelectiveDisclosureEngine.create_credential_commitment(attributes)
         merkle_root = commitment["merkle_root"]
 
-        # Compute Authenticated Credential Envelope message M (Section 2.2)
+        # Compute Authenticated Credential Envelope message M (Protocol xeno-merkle-mldsa-v2)
         envelope_digest, _ = compute_authenticated_envelope_message(
             issuer_did=issuer.did,
             credential_id=str(cred_id),
@@ -52,7 +56,7 @@ class CredentialService:
             schema_id=schema_id
         )
 
-        # Determine signed payload: Envelope M or Root R
+        # Determine signed payload: UTF-8 hex digest M (default) or legacy Root R
         if bind_envelope:
             payload_to_sign = envelope_digest.encode("utf-8")
         else:
@@ -82,6 +86,7 @@ class CredentialService:
         )
 
         return {
+            "protocol_version": PROTOCOL_VERSION,
             "credential_id": str(cred.id),
             "subject_did": subject_did,
             "issuer_did": issuer.did,

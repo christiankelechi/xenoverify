@@ -1,33 +1,64 @@
 """
-Merkle-Tree Selective Disclosure Engine.
+Merkle-Tree Selective Disclosure Engine (Protocol: xeno-merkle-mldsa-v2).
 Implements:
-1. Cryptographically salted attribute leaf construction: H(attribute_key || value || salt).
-2. Merkle Root synthesis and sibling authentication path extraction.
-3. Cryptographic selective disclosure verification (Holder presents selected leaves + paths,
-   Verifier recomputes the Merkle root and validates against the Issuer's signed root).
-Protects against attribute substitution, mix-and-match attacks, and linkage.
+1. Domain-separated, type-preserving salted attribute leaf construction:
+   SHA-256(b"\x00" + canonical_json([key, value, salt_hex])).
+2. Domain-separated Merkle node aggregation and root synthesis:
+   SHA-256(b"\x01" + min(left_hex, right_hex) || max(left_hex, right_hex)).
+3. Domain-separated Authenticated Credential Envelope Message M:
+   SHA-256(b"\x02" + canonical_json([schema_id, issuer_did, credential_id, subject_did, merkle_root])).
+   Signing invokes ML-DSA-65 / ECDSA over M.encode("utf-8") (the 64-byte UTF-8 ASCII representation
+   of the lowercase hexadecimal SHA-256 digest M).
+4. Cryptographic selective disclosure verification (Holder presents selected leaves + paths,
+   Verifier recomputes the Merkle root and validates against the Issuer's signed envelope).
 """
 
 import hashlib
-import os
+import re
 import json
 import secrets
 from typing import Dict, Any, List, Tuple, Optional
 
 
+PROTOCOL_VERSION = "xeno-merkle-mldsa-v2"
+LEAF_DOMAIN = b"\x00"
+NODE_DOMAIN = b"\x01"
+ENVELOPE_DOMAIN = b"\x02"
+
+_VALID_KEY_RE = re.compile(r"^[A-Za-z0-9_]+$")
+_VALID_SALT_RE = re.compile(r"^[0-9a-f]{32}$")
+
+
 def canonical_attribute_encoding(key: str, value: Any, salt_hex: str) -> bytes:
     """
-    Constructs the canonical attribute payload: UTF-8 encoded 'key:value:salt'.
-    Ensures deterministic, cross-platform byte serialization.
+    Constructs the canonical, domain-separated leaf preimage (Protocol xeno-merkle-mldsa-v2):
+        b"\\x00" + JSON([key, value, salt_hex]) using compact separators (",", ":").
+    Enforces restrictive key syntax (alphanumeric/underscore only; forbids colons and whitespace),
+    validates 32-char lowercase hex salt, and preserves JSON scalar types (e.g., int 18 != str "18").
     """
-    return f"{key}:{str(value)}:{salt_hex}".encode("utf-8")
+    if not isinstance(key, str) or not _VALID_KEY_RE.fullmatch(key):
+        raise ValueError(
+            f"Attribute key {key!r} is invalid under restrictive schema: must match ^[A-Za-z0-9_]+$ "
+            "(colons ':' and non-alphanumeric delimiters are forbidden)."
+        )
+    if not isinstance(salt_hex, str) or not _VALID_SALT_RE.fullmatch(salt_hex):
+        raise ValueError(
+            f"Salt {salt_hex!r} is invalid: expected 32 lowercase hexadecimal characters (128 bits)."
+        )
+    if value is not None and not isinstance(value, (str, int, float, bool)):
+        raise ValueError(
+            f"Attribute value for key '{key}' has unsupported type {type(value).__name__}: "
+            "only JSON scalar values (str, int, float, bool, None) are permitted."
+        )
+    canonical_json = json.dumps([key, value, salt_hex], separators=(",", ":"), ensure_ascii=False, allow_nan=False)
+    return LEAF_DOMAIN + canonical_json.encode("utf-8")
 
 
 def hash_leaf(key: str, value: Any, salt_hex: str) -> str:
     """
-    Constructs a salted leaf hash:
-    H(key : value : salt)
-    Prevents rainbow table / brute-force attacks on low-entropy attributes.
+    Constructs a domain-separated salted leaf hash:
+    SHA-256(0x00 || JSON([key, value, salt_hex])).
+    Prevents dictionary/rainbow-table inversion on low-entropy attributes and distinguishes types.
     """
     payload = canonical_attribute_encoding(key, value, salt_hex)
     return hashlib.sha256(payload).hexdigest()
@@ -35,9 +66,12 @@ def hash_leaf(key: str, value: Any, salt_hex: str) -> str:
 
 def hash_pair(left_hex: str, right_hex: str) -> str:
     """
-    Combines two child hashes in sorted lexicographical order to prevent second-preimage attacks.
+    Combines two child hashes in sorted lexicographical order with NODE_DOMAIN (0x01) separation
+    to bind sibling ordering and separate internal nodes from leaf/envelope commitments.
     """
-    combined = (min(left_hex, right_hex) + max(left_hex, right_hex)).encode("utf-8")
+    if not isinstance(left_hex, str) or not isinstance(right_hex, str):
+        raise ValueError("Merkle node hashes must be hexadecimal strings.")
+    combined = NODE_DOMAIN + (min(left_hex, right_hex) + max(left_hex, right_hex)).encode("utf-8")
     return hashlib.sha256(combined).hexdigest()
 
 
@@ -49,11 +83,29 @@ def compute_authenticated_envelope_message(
     schema_id: str = "urn:xeno:schema:id-credential:v1"
 ) -> Tuple[str, bytes]:
     """
-    Domain-Separated Authenticated Credential Envelope Message M.
-    Reconciles root-only signing with credential metadata binding into a single cryptographic payload:
-    M = SHA-256( schema_id || ':' || issuer_did || ':' || credential_id || ':' || subject_did || ':' || merkle_root )
+    Domain-Separated Authenticated Credential Envelope Message M (Protocol xeno-merkle-mldsa-v2).
+    Eliminates colon-delimited ambiguity (given DIDs/URNs contain colons) via JSON tuple encoding:
+        raw_payload = b"\\x02" + JSON([schema_id, issuer_did, credential_id, subject_did, merkle_root]).encode("utf-8")
+        M = SHA-256(raw_payload).hexdigest()
+    Note: The signing primitive (ML-DSA-65 or ECDSA) signs M.encode("utf-8") — the 64-byte UTF-8 ASCII
+    representation of the lowercase hex digest M, NOT a raw 32-byte digest.
     """
-    raw_payload = f"{schema_id}:{issuer_did}:{credential_id}:{subject_did}:{merkle_root}".encode("utf-8")
+    for field_name, field_val in [
+        ("schema_id", schema_id),
+        ("issuer_did", issuer_did),
+        ("credential_id", credential_id),
+        ("subject_did", subject_did),
+        ("merkle_root", merkle_root),
+    ]:
+        if not isinstance(field_val, str) or not field_val:
+            raise ValueError(f"Envelope field '{field_name}' must be a non-empty string.")
+    envelope_json = json.dumps(
+        [schema_id, issuer_did, credential_id, subject_did, merkle_root],
+        separators=(",", ":"),
+        ensure_ascii=False,
+        allow_nan=False,
+    )
+    raw_payload = ENVELOPE_DOMAIN + envelope_json.encode("utf-8")
     digest_hex = hashlib.sha256(raw_payload).hexdigest()
     return digest_hex, raw_payload
 
@@ -65,8 +117,11 @@ def build_replay_protection_token(
     disclosed_keys: List[str]
 ) -> str:
     """
-    Constructs presentation-level replay protection token:
-    Binds credential ID, verifier challenge nonce, presentation timestamp, and disclosed keys.
+    Constructs presentation-level freshness binding token T:
+        T = SHA-256(credential_id || ':' || verifier_nonce || ':' || timestamp_iso || ':' || sorted_disclosed_keys_csv)
+    Note: T is an unkeyed public integrity digest over challenge context; it binds credential ID,
+    verifier challenge nonce, timestamp, and disclosed keys, but does NOT bind verifier audience or
+    demonstrate holder private-key possession.
     """
     keys_str = ",".join(sorted(disclosed_keys))
     raw = f"{credential_id}:{verifier_nonce}:{timestamp_iso}:{keys_str}".encode("utf-8")
@@ -214,21 +269,39 @@ class SelectiveDisclosureEngine:
         """
         Verifier takes the disclosed claims, re-computes each leaf hash, walks the Merkle path,
         and verifies if every claim mathematically anchors to the expected signed Merkle root.
+        Catches malformed encodings, missing path fields, and type errors cleanly.
         """
-        if not disclosed_claims:
+        if not disclosed_claims or not isinstance(disclosed_claims, list):
             return {"valid": False, "error": "No disclosed claims provided"}
 
         for claim in disclosed_claims:
+            if not isinstance(claim, dict):
+                return {"valid": False, "error": "Malformed disclosed claim entry: expected JSON object"}
             key = claim.get("key")
             val = claim.get("value")
             salt = claim.get("salt")
             proof_path = claim.get("proof_path", [])
 
-            current_hash = hash_leaf(key, val, salt)
+            if not isinstance(proof_path, list):
+                return {
+                    "valid": False,
+                    "failed_attribute": key,
+                    "error": f"Malformed proof_path for attribute '{key}': expected list"
+                }
 
-            for step in proof_path:
-                sibling = step["sibling_hash"]
-                current_hash = hash_pair(current_hash, sibling)
+            try:
+                current_hash = hash_leaf(key, val, salt)
+                for step in proof_path:
+                    if not isinstance(step, dict) or "sibling_hash" not in step:
+                        raise ValueError(f"Malformed sibling step in proof_path for '{key}'")
+                    sibling = step["sibling_hash"]
+                    current_hash = hash_pair(current_hash, sibling)
+            except (ValueError, TypeError, KeyError) as exc:
+                return {
+                    "valid": False,
+                    "failed_attribute": key,
+                    "error": f"Malformed disclosure encoding or proof path: {exc}"
+                }
 
             if current_hash != expected_merkle_root:
                 return {
@@ -249,9 +322,8 @@ class SelectiveDisclosureEngine:
     @classmethod
     def generate_worked_synthetic_credential(cls) -> Dict[str, Any]:
         """
-        Generates a canonical, deterministic worked synthetic credential specification.
-        Used to demonstrate exact attribute encoding, leaf construction, canonical sorting,
-        intermediate tree node pairs, Merkle root R, and authenticated envelope message M.
+        Generates a canonical, deterministic worked synthetic credential specification
+        under Protocol xeno-merkle-mldsa-v2.
         """
         raw_attributes = [
             ("clearanceLevel", "Tier-3", "7f8a9b0c1d2e3f4a5b6c7d8e9f0a1b2c"),
@@ -275,12 +347,12 @@ class SelectiveDisclosureEngine:
         tree = MerkleTree(leaves)
         root = tree.root
 
-        # Envelope message M
+        # Envelope message M (Protocol xeno-merkle-mldsa-v2)
         issuer_did = "did:xeno:issuer:nimc-01"
         credential_id = "cred-9f8e7d6c"
         subject_did = "did:xeno:subject:001"
         schema_id = "urn:xeno:schema:id-credential:v1"
-        m_digest, _ = compute_authenticated_envelope_message(
+        m_digest, envelope_raw_bytes = compute_authenticated_envelope_message(
             issuer_did=issuer_did,
             credential_id=credential_id,
             subject_did=subject_did,
@@ -289,6 +361,7 @@ class SelectiveDisclosureEngine:
         )
 
         return {
+            "protocol_version": PROTOCOL_VERSION,
             "attributes": raw_attributes,
             "leaves": leaves,
             "tree_levels": tree.levels,
@@ -297,5 +370,6 @@ class SelectiveDisclosureEngine:
             "credential_id": credential_id,
             "subject_did": subject_did,
             "schema_id": schema_id,
+            "envelope_preimage_utf8": envelope_raw_bytes[1:].decode("utf-8"),
             "authenticated_message_m": m_digest
         }

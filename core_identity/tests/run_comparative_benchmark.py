@@ -1,53 +1,64 @@
 #!/usr/bin/env python3
 """
-Comparative Cryptographic Benchmarking Protocol Runner.
-Implements Section 6 Protocol Specifications & Chapter 4 Evaluation:
-- Compares NIST FIPS 204 ML-DSA-65 against Classical Baseline (ECDSA secp256k1)
-- 5 Discarded warm-up rounds to eliminate initial CPU scaling and JIT / memory allocation artifacts
-- 50 Measured trial iterations per scheme
-- Monotonic timing boundaries via time.perf_counter()
-- Memory footprint profiling via tracemalloc
-- Descriptive metrics: Mean, Std Dev, Median (p50), 95th Percentile (p95), Min, Max, 95% CI (Student-t)
-- Output:
-    - docs/comparative_benchmark_results.csv
-    - docs/comparative_benchmark_results.json
+Comparative Cryptographic Benchmarking Protocol Runner (Protocol: xeno-merkle-mldsa-v2).
+Compares NIST FIPS 204 ML-DSA-65 (dilithium-py pure Python) against Classical ECDSA secp256k1
+(cryptography OpenSSL C backend):
+- 5 discarded warm-up rounds per scheme
+- 50 measured sequential trials per scheme (key generation, signing UTF-8(M), verification)
+- High-resolution monotonic clock (time.perf_counter())
+- Per-trial and overall Python-managed heap allocation via tracemalloc
+- Exact raw vs DER/Base64/compact UTF-8 JSON packet byte measurements with explicit field lists
+
+Outputs:
+- docs/latest/comparative_benchmark_results.csv
+- docs/latest/comparative_benchmark_results.json
 """
 
-import os
-import sys
-import time
-import math
 import csv
 import json
+import math
+import os
 import statistics
+import sys
+import time
 import tracemalloc
-from datetime import datetime
+import uuid
+from datetime import datetime, timezone
 
-# Setup Django Environment
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+sys.path.insert(0, PROJECT_ROOT)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "backend_django.settings")
 
 import django
 django.setup()
 
+from cryptography.hazmat.primitives import serialization
 from core_identity.crypto_service import PQCService, ECDSABaselineService
-from core_identity.merkle_engine import SelectiveDisclosureEngine, compute_authenticated_envelope_message
+from core_identity.merkle_engine import (
+    PROTOCOL_VERSION,
+    SelectiveDisclosureEngine,
+    compute_authenticated_envelope_message,
+    build_replay_protection_token,
+)
+from run_feasibility_100 import collect_environment_metadata
 
 
-def compute_distribution(latencies):
-    """Computes descriptive statistics and 95% Student's t confidence interval."""
-    n = len(latencies)
-    mean_val = statistics.mean(latencies)
-    std_val = statistics.stdev(latencies) if n > 1 else 0.0
-    sorted_vals = sorted(latencies)
-    p50_val = statistics.median(sorted_vals)
-    p95_idx = int(math.ceil(0.95 * n)) - 1
-    p95_val = sorted_vals[min(p95_idx, n - 1)]
-    min_val = min(latencies)
-    max_val = max(latencies)
+def compute_distribution(values):
+    """Sample SD (N-1), Median, Linear-Interpolation p95 at 0.95*(N-1), Nearest-Rank p95, and 95% Student-t CI."""
+    n = len(values)
+    mean_val = statistics.mean(values)
+    std_val = statistics.stdev(values) if n > 1 else 0.0
+    s = sorted(values)
+    p50_val = statistics.median(s)
 
-    # Student's t critical value for df=n-1 at 95% confidence (t ~ 2.009 for n=50)
-    t_crit = 2.009 if n >= 50 else 2.093
+    pos = 0.95 * (n - 1)
+    lo = int(math.floor(pos))
+    hi = int(math.ceil(pos))
+    p95_linear = s[lo] + (pos - lo) * (s[hi] - s[lo])
+    p95_nearest = s[min(int(math.ceil(0.95 * n)) - 1, n - 1)]
+
+    t_crit = 2.010 if n == 50 else (1.984 if n >= 60 else 2.093)
     ci_margin = t_crit * (std_val / math.sqrt(n)) if n > 1 else 0.0
 
     return {
@@ -55,260 +66,353 @@ def compute_distribution(latencies):
         "mean_ms": round(mean_val, 3),
         "std_ms": round(std_val, 3),
         "median_ms": round(p50_val, 3),
-        "p95_ms": round(p95_val, 3),
-        "min_ms": round(min_val, 3),
-        "max_ms": round(max_val, 3),
-        "ci_95_ms": round(ci_margin, 3)
+        "p95_linear_ms": round(p95_linear, 3),
+        "p95_nearest_ms": round(p95_nearest, 3),
+        "min_ms": round(s[0], 3),
+        "max_ms": round(s[-1], 3),
+        "ci_95_ms": round(ci_margin, 3),
     }
 
 
-def run_comparative_benchmark(iterations=50, warmup=5):
-    """
-    Executes the comparative cryptographic protocol.
-    """
-    print("=" * 85)
-    print("XENOVERIFY COMPARATIVE CRYPTOGRAPHIC BENCHMARKING PROTOCOL")
-    print("Schemes: NIST FIPS 204 ML-DSA-65 vs Classical ECDSA (secp256k1)")
-    print(f"Protocol: {warmup} Discarded Warm-up Rounds + {iterations} Measured Consecutive Trials")
-    print("=" * 85)
+def compute_mem_distribution(byte_values):
+    n = len(byte_values)
+    mean_b = statistics.mean(byte_values)
+    max_b = max(byte_values)
+    min_b = min(byte_values)
+    med_b = statistics.median(byte_values)
+    return {
+        "n": n,
+        "mean_bytes": round(mean_b, 1),
+        "mean_mib": round(mean_b / 1048576.0, 4),
+        "median_bytes": round(med_b, 1),
+        "median_mib": round(med_b / 1048576.0, 4),
+        "min_bytes": int(min_b),
+        "max_bytes": int(max_b),
+        "max_mib": round(max_b / 1048576.0, 4),
+    }
 
-    # Standard worked synthetic credential attributes
+
+def measure_packet_footprints(attributes, disclosed_keys):
+    """Measures exact raw, DER/Base64, and compact UTF-8 JSON payload sizes for both schemes."""
+    commitment = SelectiveDisclosureEngine.create_credential_commitment(attributes)
+    root = commitment["merkle_root"]
+    cred_id = "cred-benchmark-001"
+    issuer_did = "did:xeno:issuer:nimc-01"
+    subject_did = "did:xeno:subject:001"
+    schema_id = "urn:xeno:schema:id-credential:v1"
+
+    m_digest, _ = compute_authenticated_envelope_message(
+        issuer_did=issuer_did,
+        credential_id=cred_id,
+        subject_did=subject_did,
+        merkle_root=root,
+        schema_id=schema_id,
+    )
+    payload_bytes = m_digest.encode("utf-8")
+    proof = SelectiveDisclosureEngine.generate_disclosure_proof(commitment["leaves"], disclosed_keys)
+    nonce = "a" * 32
+    ts = "2026-11-19T00:00:00+00:00"
+    tok = build_replay_protection_token(cred_id, nonce, ts, disclosed_keys)
+
+    pqc_kp = PQCService.generate_keypair()
+    pqc_sig = PQCService.sign(payload_bytes, pqc_kp["secret_key_b64"])
+
+    ec_kp = ECDSABaselineService.generate_keypair()
+    ec_sig = ECDSABaselineService.sign(payload_bytes, ec_kp["secret_key_b64"])
+
+    # ECDSA uncompressed point is 65 bytes (0x04 || x || y) -> raw affine coordinates = 64 bytes
+    import base64
+    ec_pk_obj = serialization.load_der_public_key(base64.b64decode(ec_kp["public_key_b64"]))
+    ec_uncompressed = ec_pk_obj.public_bytes(
+        encoding=serialization.Encoding.X962,
+        format=serialization.PublicFormat.UncompressedPoint,
+    )
+
+    def build_packets(scheme_name, pk_b64, sig_b64):
+        full_cred = {
+            "protocol_version": PROTOCOL_VERSION,
+            "credential_id": cred_id,
+            "subject_did": subject_did,
+            "issuer_did": issuer_did,
+            "schema_id": schema_id,
+            "merkle_root": root,
+            "envelope_message": m_digest,
+            "signature_scheme": scheme_name,
+            "signature_b64": sig_b64,
+            "attributes": attributes,
+            "leaves": commitment["leaves"],
+        }
+        pres_with_pk = {
+            "protocol_version": PROTOCOL_VERSION,
+            "credential_id": cred_id,
+            "subject_did": subject_did,
+            "issuer_did": issuer_did,
+            "issuer_public_key_b64": pk_b64,
+            "schema_id": schema_id,
+            "merkle_root": root,
+            "envelope_message": m_digest,
+            "signature_scheme": scheme_name,
+            "signature_b64": sig_b64,
+            "disclosed_claims": proof["disclosed_claims"],
+            "verifier_nonce": nonce,
+            "timestamp_iso": ts,
+            "replay_token": tok,
+        }
+        pres_registry = {k: v for k, v in pres_with_pk.items() if k != "issuer_public_key_b64"}
+
+        def sz(obj):
+            return len(json.dumps(obj, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+        return {
+            "full_credential_json_bytes": sz(full_cred),
+            "full_credential_fields": list(full_cred.keys()),
+            "presentation_registry_resolved_json_bytes": sz(pres_registry),
+            "presentation_registry_resolved_fields": list(pres_registry.keys()),
+            "presentation_with_public_key_json_bytes": sz(pres_with_pk),
+            "presentation_with_public_key_fields": list(pres_with_pk.keys()),
+            "public_key_b64_chars": len(pk_b64),
+            "signature_b64_chars": len(sig_b64),
+        }
+
+    pqc_pkts = build_packets(PQCService.SCHEME_NAME, pqc_kp["public_key_b64"], pqc_sig["signature_b64"])
+    ec_pkts = build_packets(ECDSABaselineService.SCHEME_NAME, ec_kp["public_key_b64"], ec_sig["signature_b64"])
+
+    return {
+        "serialization_convention": "Compact UTF-8 JSON using json.dumps(..., separators=(',', ':'), ensure_ascii=False).encode('utf-8') on 6-attribute Alex Carter fixture with 2/6 attributes disclosed (fullName, nationality).",
+        "ml_dsa_65": {
+            "public_key_raw_bytes": pqc_kp["public_key_bytes"],
+            "secret_key_raw_bytes": pqc_kp["secret_key_bytes"],
+            "signature_raw_bytes": pqc_sig["signature_bytes"],
+            **pqc_pkts,
+        },
+        "ecdsa_secp256k1": {
+            "public_key_raw_coords_bytes": len(ec_uncompressed) - 1,
+            "public_key_uncompressed_sec1_bytes": len(ec_uncompressed),
+            "public_key_spki_der_bytes": ec_kp["public_key_bytes"],
+            "secret_key_raw_scalar_bytes": 32,
+            "secret_key_pkcs8_der_bytes": ec_kp["secret_key_bytes"],
+            "signature_raw_rs_bytes": 64,
+            "signature_asn1_der_bytes_observed": ec_sig["signature_bytes"],
+            **ec_pkts,
+        },
+    }
+
+
+def run_comparative_benchmark(iterations=50, warmup=5, memory_profile_trials=10, output_dir=None):
+    if output_dir is None:
+        output_dir = os.path.join(PROJECT_ROOT, "docs", "latest")
+    os.makedirs(output_dir, exist_ok=True)
+    csv_path = os.path.join(output_dir, "comparative_benchmark_results.csv")
+    json_path = os.path.join(output_dir, "comparative_benchmark_results.json")
+
+    run_id = f"comp-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}-{uuid.uuid4().hex[:6]}"
+    env_meta = collect_environment_metadata()
+
+    print("=" * 90)
+    print(f"XENOVERIFY COMPARATIVE CRYPTOGRAPHIC BENCHMARK ({PROTOCOL_VERSION})")
+    print(
+        f"Run ID: {run_id} | Warm-ups: {warmup}/scheme | "
+        f"Timing (tracemalloc OFF): {iterations}/scheme | Memory pass: {memory_profile_trials}/scheme"
+    )
+    print(f"Host: {env_meta['hardware']['model']} | {env_meta['hardware']['cpu']} | {env_meta['hardware']['ram_gb']} GB RAM")
+    print("=" * 90)
+
     attributes = {
         "fullName": "Alex Carter",
         "nin": "29837492812",
         "dob": "1992-06-14",
         "nationality": "Nigerian",
         "clearanceLevel": "Tier-3",
-        "residence": "Victoria Island, Lagos"
+        "residence": "Victoria Island, Lagos",
     }
-    commitment = SelectiveDisclosureEngine.create_credential_commitment(attributes)
-    root = commitment["merkle_root"]
+    disclosed_keys = ["fullName", "nationality"]
 
-    # Compute Authenticated Envelope message M
+    commitment = SelectiveDisclosureEngine.create_credential_commitment(attributes)
     m_digest, _ = compute_authenticated_envelope_message(
         issuer_did="did:xeno:issuer:nimc-01",
         credential_id="cred-benchmark-001",
         subject_did="did:xeno:subject:001",
-        merkle_root=root,
-        schema_id="urn:xeno:schema:id-credential:v1"
+        merkle_root=commitment["merkle_root"],
+        schema_id="urn:xeno:schema:id-credential:v1",
     )
     payload_bytes = m_digest.encode("utf-8")
 
-    # -------------------------------------------------------------
-    # 1. Warm-up Phase (Discarded)
-    # -------------------------------------------------------------
-    print(f"\n[1/3] Executing {warmup} warm-up rounds to stabilize processor clock and cache...")
+    # 1. Warm-up phase (excluded; tracemalloc OFF)
+    print(f"\n[1/4] Executing {warmup} discarded warm-up rounds per scheme...")
     for _ in range(warmup):
-        pqc_kp = PQCService.generate_keypair()
-        pqc_s = PQCService.sign(payload_bytes, pqc_kp["secret_key_b64"])
-        PQCService.verify(payload_bytes, pqc_s["signature_b64"], pqc_kp["public_key_b64"])
+        pkp = PQCService.generate_keypair()
+        psg = PQCService.sign(payload_bytes, pkp["secret_key_b64"])
+        assert PQCService.verify(payload_bytes, psg["signature_b64"], pkp["public_key_b64"])["valid"]
 
-        ec_kp = ECDSABaselineService.generate_keypair()
-        ec_s = ECDSABaselineService.sign(payload_bytes, ec_kp["secret_key_b64"])
-        ECDSABaselineService.verify(payload_bytes, ec_s["signature_b64"], ec_kp["public_key_b64"])
+        ekp = ECDSABaselineService.generate_keypair()
+        esg = ECDSABaselineService.sign(payload_bytes, ekp["secret_key_b64"])
+        assert ECDSABaselineService.verify(payload_bytes, esg["signature_b64"], ekp["public_key_b64"])["valid"]
 
-    # -------------------------------------------------------------
-    # 2. Benchmark NIST FIPS 204 ML-DSA-65
-    # -------------------------------------------------------------
-    print(f"\n[2/3] Profiling NIST FIPS 204 ML-DSA-65 across {iterations} trials...")
-    pqc_keygen_times = []
-    pqc_sign_times = []
-    pqc_verify_times = []
+    # 2. Profile ML-DSA-65 pure timing (tracemalloc OFF)
+    print(f"\n[2/4] Profiling NIST FIPS 204 ML-DSA-65 ({iterations} uninstrumented trials)...")
+    pqc_keygen_ms, pqc_sign_ms, pqc_verify_ms = [], [], []
+    pqc_bench_kp = PQCService.generate_keypair()
 
-    pqc_benchmark_kp = PQCService.generate_keypair()
-    pk_pqc_bytes = pqc_benchmark_kp["public_key_bytes"]
-    sk_pqc_bytes = pqc_benchmark_kp["secret_key_bytes"]
-    sig_pqc_bytes = PQCService.FIPS204_SIG_BYTES
-
-    tracemalloc.start()
     for i in range(1, iterations + 1):
-        # Keygen
         t0 = time.perf_counter()
-        kp = PQCService.generate_keypair()
+        _ = PQCService.generate_keypair()
         t1 = time.perf_counter()
-        pqc_keygen_times.append((t1 - t0) * 1000)
+        pqc_keygen_ms.append((t1 - t0) * 1000.0)
 
-        # Sign
         t0 = time.perf_counter()
-        sig = PQCService.sign(payload_bytes, pqc_benchmark_kp["secret_key_b64"])
+        sig = PQCService.sign(payload_bytes, pqc_bench_kp["secret_key_b64"])
         t1 = time.perf_counter()
-        pqc_sign_times.append((t1 - t0) * 1000)
+        pqc_sign_ms.append((t1 - t0) * 1000.0)
 
-        # Verify
         t0 = time.perf_counter()
-        v = PQCService.verify(payload_bytes, sig["signature_b64"], pqc_benchmark_kp["public_key_b64"])
+        v = PQCService.verify(payload_bytes, sig["signature_b64"], pqc_bench_kp["public_key_b64"])
         t1 = time.perf_counter()
-        pqc_verify_times.append((t1 - t0) * 1000)
-        assert v["valid"], f"PQC verification failed on trial {i}"
+        assert v["valid"], f"ML-DSA-65 verify failed at trial {i}"
+        pqc_verify_ms.append((t1 - t0) * 1000.0)
 
         if i % 10 == 0 or i == iterations:
-            print(f"  [ML-DSA-65] Completed trial {i:2d}/{iterations} (Sign: {pqc_sign_times[-1]:.2f} ms, Verify: {pqc_verify_times[-1]:.2f} ms)")
+            print(f"  [ML-DSA-65 {i:2d}/{iterations}] keygen={pqc_keygen_ms[-1]:.2f} ms | sign={pqc_sign_ms[-1]:.2f} ms | verify={pqc_verify_ms[-1]:.2f} ms")
 
-    _, pqc_peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    # 3. Profile Classical ECDSA secp256k1 pure timing (tracemalloc OFF)
+    print(f"\n[3/4] Profiling Classical ECDSA secp256k1 ({iterations} uninstrumented trials)...")
+    ecdsa_keygen_ms, ecdsa_sign_ms, ecdsa_verify_ms = [], [], []
+    ecdsa_bench_kp = ECDSABaselineService.generate_keypair()
 
-    # -------------------------------------------------------------
-    # 3. Benchmark Classical ECDSA Baseline (secp256k1)
-    # -------------------------------------------------------------
-    print(f"\n[3/3] Profiling Classical ECDSA (secp256k1) across {iterations} trials...")
-    ecdsa_keygen_times = []
-    ecdsa_sign_times = []
-    ecdsa_verify_times = []
-
-    ecdsa_benchmark_kp = ECDSABaselineService.generate_keypair()
-    pk_ecdsa_bytes = ecdsa_benchmark_kp["public_key_bytes"]
-    sk_ecdsa_bytes = ecdsa_benchmark_kp["secret_key_bytes"]
-    sample_ecdsa_sig = ECDSABaselineService.sign(payload_bytes, ecdsa_benchmark_kp["secret_key_b64"])
-    sig_ecdsa_bytes = sample_ecdsa_sig["signature_bytes"]
-
-    tracemalloc.start()
     for i in range(1, iterations + 1):
-        # Keygen
         t0 = time.perf_counter()
-        kp = ECDSABaselineService.generate_keypair()
+        _ = ECDSABaselineService.generate_keypair()
         t1 = time.perf_counter()
-        ecdsa_keygen_times.append((t1 - t0) * 1000)
+        ecdsa_keygen_ms.append((t1 - t0) * 1000.0)
 
-        # Sign
         t0 = time.perf_counter()
-        sig = ECDSABaselineService.sign(payload_bytes, ecdsa_benchmark_kp["secret_key_b64"])
+        sig = ECDSABaselineService.sign(payload_bytes, ecdsa_bench_kp["secret_key_b64"])
         t1 = time.perf_counter()
-        ecdsa_sign_times.append((t1 - t0) * 1000)
+        ecdsa_sign_ms.append((t1 - t0) * 1000.0)
 
-        # Verify
         t0 = time.perf_counter()
-        v = ECDSABaselineService.verify(payload_bytes, sig["signature_b64"], ecdsa_benchmark_kp["public_key_b64"])
+        v = ECDSABaselineService.verify(payload_bytes, sig["signature_b64"], ecdsa_bench_kp["public_key_b64"])
         t1 = time.perf_counter()
-        ecdsa_verify_times.append((t1 - t0) * 1000)
-        assert v["valid"], f"ECDSA verification failed on trial {i}"
+        assert v["valid"], f"ECDSA verify failed at trial {i}"
+        ecdsa_verify_ms.append((t1 - t0) * 1000.0)
 
         if i % 10 == 0 or i == iterations:
-            print(f"  [ECDSA]     Completed trial {i:2d}/{iterations} (Sign: {ecdsa_sign_times[-1]:.2f} ms, Verify: {ecdsa_verify_times[-1]:.2f} ms)")
+            print(f"  [ECDSA     {i:2d}/{iterations}] keygen={ecdsa_keygen_ms[-1]:.2f} ms | sign={ecdsa_sign_ms[-1]:.2f} ms | verify={ecdsa_verify_ms[-1]:.2f} ms")
 
-    _, ecdsa_peak_mem = tracemalloc.get_traced_memory()
-    tracemalloc.stop()
+    # 4. Isolated tracemalloc profiling pass per scheme
+    print(f"\n[4/4] Isolated tracemalloc heap pass ({memory_profile_trials} trials per scheme)...")
+    pqc_peak_bytes, pqc_inst_total_ms = [], []
+    ecdsa_peak_bytes, ecdsa_inst_total_ms = [], []
 
-    # Statistical Distributions
-    pqc_keygen_dist = compute_distribution(pqc_keygen_times)
-    pqc_sign_dist = compute_distribution(pqc_sign_times)
-    pqc_verify_dist = compute_distribution(pqc_verify_times)
+    tracemalloc.start()
+    try:
+        pqc_baseline_mem, _ = tracemalloc.get_traced_memory()
+        for i in range(1, memory_profile_trials + 1):
+            tracemalloc.reset_peak()
+            t0 = time.perf_counter()
+            _ = PQCService.generate_keypair()
+            sig = PQCService.sign(payload_bytes, pqc_bench_kp["secret_key_b64"])
+            v = PQCService.verify(payload_bytes, sig["signature_b64"], pqc_bench_kp["public_key_b64"])
+            assert v["valid"], f"ML-DSA-65 memory trial {i} failed"
+            pqc_inst_total_ms.append((time.perf_counter() - t0) * 1000.0)
+            _, peak_b = tracemalloc.get_traced_memory()
+            pqc_peak_bytes.append(int(peak_b))
 
-    ecdsa_keygen_dist = compute_distribution(ecdsa_keygen_times)
-    ecdsa_sign_dist = compute_distribution(ecdsa_sign_times)
-    ecdsa_verify_dist = compute_distribution(ecdsa_verify_times)
+        ecdsa_baseline_mem, _ = tracemalloc.get_traced_memory()
+        for i in range(1, memory_profile_trials + 1):
+            tracemalloc.reset_peak()
+            t0 = time.perf_counter()
+            _ = ECDSABaselineService.generate_keypair()
+            sig = ECDSABaselineService.sign(payload_bytes, ecdsa_bench_kp["secret_key_b64"])
+            v = ECDSABaselineService.verify(payload_bytes, sig["signature_b64"], ecdsa_bench_kp["public_key_b64"])
+            assert v["valid"], f"ECDSA memory trial {i} failed"
+            ecdsa_inst_total_ms.append((time.perf_counter() - t0) * 1000.0)
+            _, peak_b = tracemalloc.get_traced_memory()
+            ecdsa_peak_bytes.append(int(peak_b))
+    finally:
+        tracemalloc.stop()
 
-    # -------------------------------------------------------------
-    # 4. Formatted Summary Table
-    # -------------------------------------------------------------
-    print("\n" + "=" * 100)
-    print("COMPARATIVE CRYPTOGRAPHIC BENCHMARK RESULTS (N = 50 TRIALS)")
-    print("=" * 100)
-    header = f"{'Metric / Operation':<28} | {'ECDSA (secp256k1)':<24} | {'ML-DSA-65 (FIPS 204)':<24} | {'Differential Ratio':<15}"
-    print(header)
-    print("-" * 100)
+    print(f"  ML-DSA-65 peak Python heap: max={max(pqc_peak_bytes):,} B ({max(pqc_peak_bytes)/1048576.0:.3f} MiB)")
+    print(f"  ECDSA     peak Python heap: max={max(ecdsa_peak_bytes):,} B ({max(ecdsa_peak_bytes)/1048576.0:.3f} MiB)")
 
-    # Storage Footprints
-    print(f"{'Security Category':<28} | {'Classical 128-bit':<24} | {'NIST Category 3':<24} | {'Quantum-Safe':<15}")
-    print(f"{'Public Key Size':<28} | {f'{pk_ecdsa_bytes} Bytes':<24} | {f'{pk_pqc_bytes} Bytes':<24} | {f'{pk_pqc_bytes / pk_ecdsa_bytes:.1f}x larger':<15}")
-    print(f"{'Secret Key Size':<28} | {f'{sk_ecdsa_bytes} Bytes':<24} | {f'{sk_pqc_bytes} Bytes':<24} | {f'{sk_pqc_bytes / sk_ecdsa_bytes:.1f}x larger':<15}")
-    print(f"{'Signature Size':<28} | {f'{sig_ecdsa_bytes} Bytes':<24} | {f'{sig_pqc_bytes} Bytes':<24} | {f'{sig_pqc_bytes / sig_ecdsa_bytes:.1f}x larger':<15}")
-    print("-" * 100)
-
-    # Keygen
-    ec_kg_str = f"{ecdsa_keygen_dist['mean_ms']} ± {ecdsa_keygen_dist['ci_95_ms']}"
-    pqc_kg_str = f"{pqc_keygen_dist['mean_ms']} ± {pqc_keygen_dist['ci_95_ms']}"
-    kg_ratio = f"{pqc_keygen_dist['mean_ms'] / max(0.001, ecdsa_keygen_dist['mean_ms']):.1f}x"
-    print(f"{'Keygen Mean (ms)':<28} | {ec_kg_str:<24} | {pqc_kg_str:<24} | {kg_ratio}")
-    print(f"{'Keygen Median (p50) (ms)':<28} | {str(ecdsa_keygen_dist['median_ms']):<24} | {str(pqc_keygen_dist['median_ms']):<24} | {'-'}")
-
-    # Sign
-    ec_sgn_str = f"{ecdsa_sign_dist['mean_ms']} ± {ecdsa_sign_dist['ci_95_ms']}"
-    pqc_sgn_str = f"{pqc_sign_dist['mean_ms']} ± {pqc_sign_dist['ci_95_ms']}"
-    sgn_ratio = f"{pqc_sign_dist['mean_ms'] / max(0.001, ecdsa_sign_dist['mean_ms']):.1f}x"
-    print(f"{'Signing Mean (ms)':<28} | {ec_sgn_str:<24} | {pqc_sgn_str:<24} | {sgn_ratio}")
-    print(f"{'Signing Median (p50) (ms)':<28} | {str(ecdsa_sign_dist['median_ms']):<24} | {str(pqc_sign_dist['median_ms']):<24} | {'-'}")
-    print(f"{'Signing p95 (ms)':<28} | {str(ecdsa_sign_dist['p95_ms']):<24} | {str(pqc_sign_dist['p95_ms']):<24} | {'-'}")
-
-    # Verify
-    ec_ver_str = f"{ecdsa_verify_dist['mean_ms']} ± {ecdsa_verify_dist['ci_95_ms']}"
-    pqc_ver_str = f"{pqc_verify_dist['mean_ms']} ± {pqc_verify_dist['ci_95_ms']}"
-    ver_ratio = f"{pqc_verify_dist['mean_ms'] / max(0.001, ecdsa_verify_dist['mean_ms']):.1f}x"
-    print(f"{'Verify Mean (ms)':<28} | {ec_ver_str:<24} | {pqc_ver_str:<24} | {ver_ratio}")
-    print(f"{'Verify Median (p50) (ms)':<28} | {str(ecdsa_verify_dist['median_ms']):<24} | {str(pqc_verify_dist['median_ms']):<24} | {'-'}")
-    print(f"{'Verify p95 (ms)':<28} | {str(ecdsa_verify_dist['p95_ms']):<24} | {str(pqc_verify_dist['p95_ms']):<24} | {'-'}")
-    print("-" * 100)
-    print(f"{'Peak Heap Memory':<28} | {f'{ecdsa_peak_mem / (1024*1024):.2f} MB':<24} | {f'{pqc_peak_mem / (1024*1024):.2f} MB':<24} | {'Both < 5 MB'}")
-    print("=" * 100)
-
-    # -------------------------------------------------------------
-    # 5. Persist Output CSV and JSON Artifacts
-    # -------------------------------------------------------------
-    docs_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "docs"))
-    os.makedirs(docs_dir, exist_ok=True)
-    csv_path = os.path.join(docs_dir, "comparative_benchmark_results.csv")
-    json_path = os.path.join(docs_dir, "comparative_benchmark_results.json")
-
-    # CSV Write
+    # Write raw pure-timing CSV (tracemalloc OFF)
     with open(csv_path, mode="w", newline="", encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["trial", "pqc_keygen_ms", "pqc_sign_ms", "pqc_verify_ms", "ecdsa_keygen_ms", "ecdsa_sign_ms", "ecdsa_verify_ms"])
+        writer.writerow([
+            "trial",
+            "pqc_keygen_ms", "pqc_sign_ms", "pqc_verify_ms",
+            "ecdsa_keygen_ms", "ecdsa_sign_ms", "ecdsa_verify_ms",
+        ])
         for i in range(iterations):
             writer.writerow([
                 i + 1,
-                round(pqc_keygen_times[i], 3),
-                round(pqc_sign_times[i], 3),
-                round(pqc_verify_times[i], 3),
-                round(ecdsa_keygen_times[i], 3),
-                round(ecdsa_sign_times[i], 3),
-                round(ecdsa_verify_times[i], 3),
+                round(pqc_keygen_ms[i], 3),
+                round(pqc_sign_ms[i], 3),
+                round(pqc_verify_ms[i], 3),
+                round(ecdsa_keygen_ms[i], 3),
+                round(ecdsa_sign_ms[i], 3),
+                round(ecdsa_verify_ms[i], 3),
             ])
 
-    # JSON Write
-    results_payload = {
+    footprints = measure_packet_footprints(attributes, disclosed_keys)
+    pqc_uninst_total_mean = statistics.mean([pqc_keygen_ms[i] + pqc_sign_ms[i] + pqc_verify_ms[i] for i in range(iterations)])
+    ecdsa_uninst_total_mean = statistics.mean([ecdsa_keygen_ms[i] + ecdsa_sign_ms[i] + ecdsa_verify_ms[i] for i in range(iterations)])
+    pqc_inst_total_mean = statistics.mean(pqc_inst_total_ms)
+    ecdsa_inst_total_mean = statistics.mean(ecdsa_inst_total_ms)
+
+    payload = {
         "benchmark_metadata": {
-            "date": datetime.now().isoformat(),
+            "run_id": run_id,
+            "date_utc": datetime.now(timezone.utc).isoformat(),
+            "protocol_version": PROTOCOL_VERSION,
+            "call_path": "Direct cryptographic service invocations over 64-byte UTF-8(M)",
+            "key_reuse_policy": "Fresh keypair measured per trial for keygen; single pre-generated benchmark keypair reused across the 50 sign/verify iterations per scheme",
             "iterations": iterations,
             "warmup_rounds": warmup,
-            "pqc_standard": "NIST FIPS 204 (ML-DSA-65)",
-            "classical_baseline": "ECDSA (secp256k1 / SHA-256)"
-        },
-        "footprint_comparison": {
-            "ml_dsa_65": {
-                "public_key_bytes": pk_pqc_bytes,
-                "secret_key_bytes": sk_pqc_bytes,
-                "signature_bytes": sig_pqc_bytes
+            "timing_instrumentation": "tracemalloc DISABLED during all 50 measured timing iterations per scheme",
+            "pqc_standard": "NIST FIPS 204 (ML-DSA-65 via dilithium-py)",
+            "classical_baseline": "ECDSA (secp256k1 / SHA-256 via cryptography/OpenSSL)",
+            "statistics_config": {
+                "sd_divisor": "N-1 (sample standard deviation)",
+                "percentile_estimator": "Linear interpolation at zero-based index 0.95 * (N - 1) (nearest-rank also stored)",
+                "confidence_interval": "Student's t two-tailed 95% CI (t_crit = 2.010 for df=49)",
             },
-            "ecdsa": {
-                "public_key_bytes": pk_ecdsa_bytes,
-                "secret_key_bytes": sk_ecdsa_bytes,
-                "signature_bytes": sig_ecdsa_bytes
-            }
+            "memory_tracing": {
+                "tool": "Isolated Python tracemalloc pass (reset_peak() per trial; measures Python-managed heap only; excludes native OpenSSL C heap allocations and OS RSS)",
+                "isolated_profile_trials_per_scheme": memory_profile_trials,
+                "pqc_baseline_before_loop_bytes": pqc_baseline_mem,
+                "ecdsa_baseline_before_loop_bytes": ecdsa_baseline_mem,
+                "pqc_trial_peak_bytes": pqc_peak_bytes,
+                "ecdsa_trial_peak_bytes": ecdsa_peak_bytes,
+                "pqc_uninstrumented_total_mean_ms": round(pqc_uninst_total_mean, 3),
+                "pqc_instrumented_total_mean_ms": round(pqc_inst_total_mean, 3),
+                "pqc_tracemalloc_overhead_factor": round(pqc_inst_total_mean / pqc_uninst_total_mean, 2),
+                "ecdsa_uninstrumented_total_mean_ms": round(ecdsa_uninst_total_mean, 3),
+                "ecdsa_instrumented_total_mean_ms": round(ecdsa_inst_total_mean, 3),
+                "ecdsa_tracemalloc_overhead_factor": round(ecdsa_inst_total_mean / ecdsa_uninst_total_mean, 2),
+            },
+            "environment": env_meta,
         },
+        "footprint_comparison": footprints,
         "ml_dsa_65_distributions": {
-            "keygen": pqc_keygen_dist,
-            "sign": pqc_sign_dist,
-            "verify": pqc_verify_dist
+            "keygen": compute_distribution(pqc_keygen_ms),
+            "sign": compute_distribution(pqc_sign_ms),
+            "verify": compute_distribution(pqc_verify_ms),
+            "traced_python_heap_memory": compute_mem_distribution(pqc_peak_bytes),
         },
         "ecdsa_distributions": {
-            "keygen": ecdsa_keygen_dist,
-            "sign": ecdsa_sign_dist,
-            "verify": ecdsa_verify_dist
-        }
+            "keygen": compute_distribution(ecdsa_keygen_ms),
+            "sign": compute_distribution(ecdsa_sign_ms),
+            "verify": compute_distribution(ecdsa_verify_ms),
+            "traced_python_heap_memory": compute_mem_distribution(ecdsa_peak_bytes),
+        },
     }
-    with open(json_path, mode="w", encoding="utf-8") as f:
-        json.dump(results_payload, f, indent=2)
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
 
-    print(f"[+] Comparative CSV written to: {csv_path}")
-    print(f"[+] Comparative JSON written to: {json_path}")
-
-    return results_payload
+    print(f"\n[+] Saved {csv_path}")
+    print(f"[+] Saved {json_path}")
 
 
 if __name__ == "__main__":
-    trials = 50
-    if len(sys.argv) > 1:
-        try:
-            trials = int(sys.argv[1])
-        except ValueError:
-            pass
-    run_comparative_benchmark(iterations=trials)
+    n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
+    run_comparative_benchmark(iterations=n)
