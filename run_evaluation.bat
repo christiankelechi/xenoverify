@@ -83,7 +83,8 @@ if errorlevel 1 (
 echo.
 echo ========================================================
 echo   [SUCCESS] All verification tests and benchmarks passed!
-echo   Results generated in docs/latest and docs/current_update_1
+echo   Benchmark results generated in docs/latest
+echo   Run the separate supervisor negative-test suite listed in README.md.
 echo ========================================================
 echo.
 pause

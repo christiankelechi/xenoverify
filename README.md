@@ -76,6 +76,17 @@ Frontend Web Dashboard will be accessible at: `http://localhost:5173/`
 
 ## 5. Prototype Demonstration & Verification Points
 
+### Supervisor evaluation on the Dell
+
+The target PC is a Dell Latitude E7240 with an Intel Core i5-4210U at 1.70 GHz, 8 GB DDR3 RAM, Intel HD Graphics and a Samsung 860 EVO mSATA 500 GB SSD (466 GB displayed in Windows). The archived November 19 tables describe the HP measurement host. Dell results are pending a run on the target PC.
+
+Run these from the repository root on the Dell in a dedicated evaluation copy with the project dependencies installed:
+
+1. `run_evaluation.bat` applies migrations and runs the Django suite, `core_identity/tests/run_feasibility_100.py`, and `core_identity/tests/run_comparative_benchmark.py`. Keep the terminal output and the CSV and JSON files in `docs/latest`.
+2. `python core_identity/tests/run_negative_battery_450.py` runs the separate negative-test suite and writes `docs/latest/negative_test_execution_450.log`. Keep the full log and check the recorded outcomes.
+
+Return the raw outputs, Windows and Python versions, and dependency versions from the Dell so the Chapter 4 tables, Chapter 5 conclusions and evidence register can be updated together.
+
 1. **Demonstrate Feasibility:** Navigate to the **"Issuer Authority"** tab and issue a credential signed with ML-DSA-65.
 2. **Demonstrate Selective Disclosure:** Open the **"Selective Disclosure Playground"**, toggle between disclosing "Name" and "Nationality" while keeping "NIN" and "Date of Birth" hidden. Click **"Verify Proof"** to see instant positive verification (~50ms).
 3. **Demonstrate Tamper Resistance (Negative Testing):** Click **"Simulate Tamper Attack"**; the verifier immediately rejects the altered payload with an explicit Merkle integrity violation.
